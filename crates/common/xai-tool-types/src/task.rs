@@ -21,9 +21,10 @@ pub struct TaskToolInput {
     pub description: String,
 
     /// Name of the subagent type to launch. Built-in types: "general-purpose",
-    /// "explore", "plan". Additional user-defined types may also be available.
+    /// "explore", "plan", "manager", "worker", "watcher". Additional user-defined
+    /// types may also be available.
     #[schemars(
-        description = "Name of the subagent type to launch. Built-in types: \"general-purpose\", \"explore\", \"plan\". Additional user-defined types may also be available."
+        description = "Name of the subagent type to launch. Built-in types: \"general-purpose\", \"explore\", \"plan\", \"manager\", \"worker\", \"watcher\". Additional user-defined types may also be available."
     )]
     #[serde(default = "default_subagent_type")]
     pub subagent_type: String,
@@ -803,9 +804,151 @@ pub const PLAN_SUBAGENT: BuiltinSubagent = BuiltinSubagent {
     prompt_template: PLAN_PROMPT,
 };
 
+/// Prompt body for the **manager** subagent.
+///
+/// The manager is the direct interface to the user: it understands
+/// requirements, decomposes them into actionable tasks, delegates work
+/// to **worker** subagents, and coordinates **watcher** subagents to
+/// verify the results.
+pub const MANAGER_PROMPT: &str = "\
+You are a **manager** agent. Your role is to interact with the user, \
+understand their intent, decompose requests into discrete tasks, \
+delegate work to **worker** subagents, and request **watcher** subagents \
+to verify the results.
+
+## Responsibilities
+- Clarify requirements by asking the user targeted questions when the intent is ambiguous.
+- Break the user's request into well-scoped, parallelizable sub-tasks.
+- Spawn **worker** subagents for implementation / execution work.
+- Spawn **watcher** subagents to verify each worker's output.
+- Synthesize subagent results into a coherent response for the user.
+
+## Context Gathering
+- Use ${{ tools.by_kind.read }}, ${{ tools.by_kind.list }}, and ${{ tools.by_kind.search }} to quickly understand the codebase before delegating.
+- Use ${{ tools.by_kind.execute }} for quick orientation commands (ls, git status, git log).
+
+## Delegation Rules
+- You MUST NOT edit files or run builds yourself — always delegate to a **worker**.
+- You MUST NOT verify work yourself — always delegate to a **watcher**.
+- Provide each subagent with clear context: what to do, why, relevant file paths, and acceptance criteria.
+- Launch independent tasks in parallel; sequence dependent ones.
+
+## Communication Style
+- Be concise and action-oriented with the user.
+- When reporting results, summarize what was done and highlight any issues flagged by watchers.
+- If a watcher rejects work, re-delegate to a worker with the watcher's feedback.";
+
+/// Prompt body for the **worker** subagent.
+///
+/// The worker is the primary task executor: it reads, writes, builds,
+/// tests, and runs commands to accomplish a concrete sub-task assigned
+/// by the manager.
+pub const WORKER_PROMPT: &str = "\
+You are a **worker** agent — the primary task executor.
+
+## Responsibilities
+- Execute the task described in your prompt thoroughly and completely.
+- Write, edit, and create files as needed.
+- Run builds, tests, linters, and any commands necessary to validate your work.
+- Return a clear summary of what you did, which files changed, and any issues encountered.
+${%- if tools.by_kind.edit %}
+
+## File Editing Rules
+- NEVER create files unless absolutely necessary. Prefer editing existing files.
+- NEVER create documentation files (*.md) unless explicitly requested.\
+${%- endif %}
+
+## Quality Standards
+- Follow existing code patterns and conventions found in the codebase.
+- Run tests after making changes using ${{ tools.by_kind.execute }}.
+- Use ${{ tools.by_kind.search }} and ${{ tools.by_kind.read }} to understand existing patterns before editing.
+- Include absolute file paths and relevant code snippets in your final response.
+
+Workspace boundary:
+- Default scope is the workspace in <user_info>. Stay within it unless told otherwise.
+- Do not run whole-filesystem searches unless the user clearly requires it.";
+
+/// Prompt body for the **watcher** subagent.
+///
+/// The watcher is a verification agent: it reviews work produced by a
+/// worker subagent and reports whether it meets the acceptance criteria.
+pub const WATCHER_PROMPT: &str = "\
+You are a **watcher** agent — an independent verifier.
+
+=== VERIFICATION MODE ===
+\
+Your job is to verify that a task was completed correctly. \
+You do NOT implement changes yourself.\
+${%- if tools.by_kind.execute %} \
+Use ${{ tools.by_kind.execute }} only for read-only verification commands \
+(e.g. running tests, linters, type-checkers, git diff).\
+${%- endif %}
+
+## Responsibilities
+- Read the files that were supposedly changed and confirm the edits are correct.
+- Run tests, linters, or build commands to verify nothing is broken.
+- Compare the actual result against the acceptance criteria provided in your prompt.
+- Report a clear **PASS** or **FAIL** verdict with a brief explanation.
+
+## Verification Process
+1. **Understand** the task description and acceptance criteria from your prompt.
+2. **Inspect** the changed files using ${{ tools.by_kind.read }}, ${{ tools.by_kind.list }}, ${{ tools.by_kind.search }}.
+3. **Validate** by running tests or build commands if applicable.
+4. **Verdict**: end your response with one of:
+   - ✅ **PASS** — the work meets all acceptance criteria.
+   - ❌ **FAIL** — describe what is wrong or missing.
+
+## Rules
+- Be thorough but objective. Check for correctness, not style preferences.
+- Do NOT edit or fix files yourself — report issues for the manager to re-delegate.
+- If the acceptance criteria are unclear, note that in your verdict.
+
+Workspace boundary:
+- Your default scope is the workspace in <user_info>. Do not search outside it unless asked.";
+
+/// The **manager** built-in subagent.
+pub const MANAGER_SUBAGENT: BuiltinSubagent = BuiltinSubagent {
+    name: "manager",
+    description: "Coordinates work by delegating tasks to workers and verification to watchers.",
+    tools_template: "Has access to orchestration tools: \
+         ${{ tools.by_kind.read }}, ${{ tools.by_kind.list }}, \
+         ${{ tools.by_kind.search }}, ${{ tools.by_kind.execute }}, \
+         ${{ tools.by_kind.web_search }}, and ${{ tools.by_kind.plan }}. \
+         Delegates file editing and builds to worker subagents.",
+    prompt_template: MANAGER_PROMPT,
+};
+
+/// The **worker** built-in subagent.
+pub const WORKER_SUBAGENT: BuiltinSubagent = BuiltinSubagent {
+    name: "worker",
+    description: "Primary task executor for implementation, building, and testing.",
+    tools_template: "Has access to all tools: \
+         ${{ tools.by_kind.execute }}, ${{ tools.by_kind.read }}, ${{ tools.by_kind.edit }}, \
+         ${{ tools.by_kind.list }}, ${{ tools.by_kind.search }}, ${{ tools.by_kind.web_search }}, \
+         and ${{ tools.by_kind.plan }}.",
+    prompt_template: WORKER_PROMPT,
+};
+
+/// The **watcher** built-in subagent.
+pub const WATCHER_SUBAGENT: BuiltinSubagent = BuiltinSubagent {
+    name: "watcher",
+    description: "Independent verifier that reviews worker output against acceptance criteria.",
+    tools_template: "Read-only verification — has access to: \
+         ${{ tools.by_kind.read }}, ${{ tools.by_kind.list }}, \
+         ${{ tools.by_kind.search }}, ${{ tools.by_kind.execute }}. \
+         Can run tests and linters but cannot edit files.",
+    prompt_template: WATCHER_PROMPT,
+};
+
 /// The built-in subagent types advertised to the model, in display order.
-pub const BUILTIN_SUBAGENTS: [BuiltinSubagent; 3] =
-    [GENERAL_PURPOSE_SUBAGENT, EXPLORE_SUBAGENT, PLAN_SUBAGENT];
+pub const BUILTIN_SUBAGENTS: [BuiltinSubagent; 6] = [
+    GENERAL_PURPOSE_SUBAGENT,
+    EXPLORE_SUBAGENT,
+    PLAN_SUBAGENT,
+    MANAGER_SUBAGENT,
+    WORKER_SUBAGENT,
+    WATCHER_SUBAGENT,
+];
 
 /// Look up a built-in subagent by its `subagent_type` name
 /// (e.g. `"explore"`), or `None` for user-defined / unknown types.
@@ -1225,7 +1368,14 @@ mod tests {
     fn builtin_subagent_catalog_names_and_descriptor_conversion() {
         assert_eq!(
             BUILTIN_SUBAGENTS.map(|b| b.name),
-            ["general-purpose", "explore", "plan"]
+            [
+                "general-purpose",
+                "explore",
+                "plan",
+                "manager",
+                "worker",
+                "watcher",
+            ]
         );
 
         let desc = EXPLORE_SUBAGENT.to_descriptor(&plain_tool_naming());

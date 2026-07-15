@@ -9,7 +9,7 @@
 //!
 //! - `SubagentBackendResource` — wraps an `Arc<dyn SubagentBackend>` that
 //!   abstracts spawn/query/cancel (see [`super::backend`])
-//! - `SubagentDepthCounter` — tracks nesting depth (max 1, no recursive spawning)
+//! - `SubagentDepthCounter` — tracks nesting depth (max 2; enables manager→worker nesting)
 //! - `SessionIdResource` — carries the current session ID for parent scoping
 //! - `TaskModelValidator` — validates explicit model slugs before background spawn
 //!
@@ -810,7 +810,8 @@ pub struct SubagentListActiveRequest {
 /// Tracks nesting depth. Injected into child's Resources with depth+1.
 ///
 /// Top-level sessions start at depth 0. Each child increments by 1.
-/// `TaskTool` rejects spawns when `depth >= MAX_SUBAGENT_DEPTH`.
+/// `TaskTool` rejects spawns when `depth >= MAX_SUBAGENT_DEPTH` (currently 2,
+/// so a manager at depth 1 can still spawn worker/watcher children).
 #[derive(Debug, Clone)]
 pub struct SubagentDepthCounter(pub u32);
 

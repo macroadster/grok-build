@@ -811,7 +811,10 @@ impl AgentBuilder {
                     .iter_mut()
                     .find(|tc| tc.id == task_tool_id)
                 {
-                    task_tc.description_override = Some(CHILD_TASK_DESCRIPTION.to_string());
+                    // Concise description, but list the same effective types so
+                    // manager→worker/watcher (and custom types) stay discoverable.
+                    task_tc.description_override =
+                        Some(build_child_task_description(&subagents));
                 }
             } else if let Some(task_tc) = tool_config
                 .tools
@@ -1226,22 +1229,39 @@ const TASK_TOOL_NAMING: xai_tool_types::TaskToolNaming<'static> = xai_tool_types
     background_retrieval_tool: "${{ tools.by_kind.background_task_action }}",
     isolation_param: "${{ params.task.isolation }}",
 };
-/// Concise task-tool description for child sessions. Delegation from a child
-/// is possible but discouraged — prefer doing the work directly.
+/// Concise task-tool description for child sessions.
 ///
-/// NOTE: This hardcodes the built-in agent type names ("general-purpose",
-/// "explore", "plan"). If custom child-visible subagent types become common,
-/// consider generating this list dynamically like the parent description does.
-const CHILD_TASK_DESCRIPTION: &str = "\
-Launch a sub-agent to handle a specific sub-task. Use this only when \n\
-the sub-task is clearly independent and would benefit from a separate \n\
-context (e.g., a parallel search while you continue working).\n\
+/// Delegation is discouraged for leaf executors, but orchestration agents
+/// (manager) must still be able to spawn worker/watcher. The type list is
+/// built from the effective subagent roster so it cannot drift from discovery.
+fn build_child_task_description(subagents: &[SubagentEntry]) -> String {
+    let type_list = if subagents.is_empty() {
+        "\"general-purpose\", \"explore\", \"plan\", \"manager\", \"worker\", or \"watcher\""
+            .to_string()
+    } else {
+        let quoted: Vec<String> = subagents
+            .iter()
+            .map(|e| format!("\"{}\"", e.name))
+            .collect();
+        match quoted.as_slice() {
+            [] => String::new(),
+            [only] => only.clone(),
+            [rest @ .., last] => format!("{}, or {last}", rest.join(", ")),
+        }
+    };
+    format!(
+        "Launch a sub-agent to handle a specific sub-task. Use this when the \
+sub-task is clearly independent, or when you are orchestrating (e.g. a \
+manager delegating to worker/watcher).\n\
 \n\
 Prefer doing the work yourself unless delegation is clearly necessary.\n\
 \n\
-Usage: specify ${{ params.task.subagent_type }} (\"general-purpose\", \"explore\", or \"plan\"), \n\
-a short ${{ params.task.description }}, and a detailed ${{ params.task.prompt }}.\n\
-${{ params.task.run_in_background }}: Returns immediately with a subagent_id. Use the task output tool to retrieve results. This is set to true by default.";
+Usage: specify ${{{{ params.task.subagent_type }}}} ({type_list}), \
+a short ${{{{ params.task.description }}}}, and a detailed ${{{{ params.task.prompt }}}}.\n\
+${{{{ params.task.run_in_background }}}}: Returns immediately with a subagent_id. \
+Use the task output tool to retrieve results. This is set to true by default."
+    )
+}
 /// CLI [`xai_tool_types::SubagentToolNaming`]: each kind maps to its
 /// `${{ tools.by_kind.* }}` template placeholder, so rendering a built-in's
 /// `tools_template` reproduces the placeholders for the CLI's `TemplateRenderer`
@@ -1265,6 +1285,9 @@ fn builtin_tools_fragment(name: BuiltinAgentName) -> String {
         BuiltinAgentName::GeneralPurpose => xai_tool_types::GENERAL_PURPOSE_SUBAGENT,
         BuiltinAgentName::Explore => xai_tool_types::EXPLORE_SUBAGENT,
         BuiltinAgentName::Plan => xai_tool_types::PLAN_SUBAGENT,
+        BuiltinAgentName::Manager => xai_tool_types::MANAGER_SUBAGENT,
+        BuiltinAgentName::Worker => xai_tool_types::WORKER_SUBAGENT,
+        BuiltinAgentName::Watcher => xai_tool_types::WATCHER_SUBAGENT,
         _ => return String::new(),
     };
     subagent.render_tools(&SUBAGENT_TOOL_NAMING)
@@ -1529,23 +1552,85 @@ mod tests {
     }
     #[test]
     fn child_task_description_is_concise() {
+        let desc = build_child_task_description(&[]);
         assert!(
-            CHILD_TASK_DESCRIPTION.contains("Prefer doing the work yourself"),
+            desc.contains("Prefer doing the work yourself"),
             "child description should discourage recursive delegation"
         );
         assert!(
-            !CHILD_TASK_DESCRIPTION.contains("Agent types:"),
+            !desc.contains("Agent types:"),
             "child description should not list agent types"
         );
         assert!(
-            !CHILD_TASK_DESCRIPTION.contains("<example>"),
+            !desc.contains("<example>"),
             "child description should not contain examples"
         );
         assert!(
-            CHILD_TASK_DESCRIPTION.len() < 700,
+            desc.len() < 900,
             "child description should be compact, got {} chars",
-            CHILD_TASK_DESCRIPTION.len()
+            desc.len()
         );
+    }
+    #[test]
+    fn child_task_description_lists_effective_types() {
+        let subagents = vec![
+            entry(
+                "manager",
+                "Coordinates work.",
+                SubagentSource::Builtin(BuiltinAgentName::Manager),
+            ),
+            entry(
+                "worker",
+                "Executes tasks.",
+                SubagentSource::Builtin(BuiltinAgentName::Worker),
+            ),
+            entry(
+                "watcher",
+                "Verifies work.",
+                SubagentSource::Builtin(BuiltinAgentName::Watcher),
+            ),
+        ];
+        let desc = build_child_task_description(&subagents);
+        assert!(desc.contains("\"manager\""));
+        assert!(desc.contains("\"worker\""));
+        assert!(desc.contains("\"watcher\""));
+        assert!(desc.contains("or \"watcher\""));
+    }
+    #[test]
+    fn build_task_description_includes_manager_worker_watcher_tools() {
+        let subagents = vec![
+            entry(
+                "manager",
+                "Coordinates work.",
+                SubagentSource::Builtin(BuiltinAgentName::Manager),
+            ),
+            entry(
+                "worker",
+                "Executes tasks.",
+                SubagentSource::Builtin(BuiltinAgentName::Worker),
+            ),
+            entry(
+                "watcher",
+                "Verifies work.",
+                SubagentSource::Builtin(BuiltinAgentName::Watcher),
+            ),
+        ];
+        let desc = build_task_description(&subagents, &[]);
+        assert!(
+            desc.contains(xai_tool_types::MANAGER_SUBAGENT.tools_template),
+            "should include manager tools_template"
+        );
+        assert!(
+            desc.contains(xai_tool_types::WORKER_SUBAGENT.tools_template),
+            "should include worker tools_template"
+        );
+        assert!(
+            desc.contains(xai_tool_types::WATCHER_SUBAGENT.tools_template),
+            "should include watcher tools_template"
+        );
+        assert!(desc.contains("- **manager**: Coordinates work."));
+        assert!(desc.contains("- **worker**: Executes tasks."));
+        assert!(desc.contains("- **watcher**: Verifies work."));
     }
     #[test]
     fn build_task_description_contains_resume_from_guidance() {

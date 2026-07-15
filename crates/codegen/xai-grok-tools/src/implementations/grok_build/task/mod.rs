@@ -26,9 +26,16 @@ use crate::types::resources::SharedResources;
 use crate::types::tool::{ToolKind, ToolNamespace};
 use xai_tool_types::{SubagentCompletedOutput, SubagentIsolationMode, TaskToolInput};
 
-/// Maximum nesting depth for subagents. A top-level session is depth 0;
-/// the first subagent is depth 1. Subagents cannot spawn further subagents.
-pub const MAX_SUBAGENT_DEPTH: u32 = 1;
+/// Maximum nesting depth for subagents.
+///
+/// - Depth 0: top-level session (main agent or top-level manager).
+/// - Depth 1: first-level subagent (e.g. a manager spawned by the main agent).
+///   May still spawn children so manager → worker/watcher works.
+/// - Depth 2: second-level subagent (worker/watcher). Task is stripped and
+///   further spawns are rejected.
+///
+/// Spawns are rejected when the caller's depth is `>= MAX_SUBAGENT_DEPTH`.
+pub const MAX_SUBAGENT_DEPTH: u32 = 2;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Tool implementation
@@ -537,13 +544,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn subagent_cannot_spawn_nested_subagent() {
+    async fn first_level_subagent_can_spawn_nested_subagent() {
+        // Depth 1 (e.g. manager) must be allowed to spawn depth-2 children
+        // (worker/watcher) so the manager→worker/watcher pipeline works.
+        let (backend, mut rx) = make_backend();
+        let mut resources = Resources::new();
+        resources.insert(backend);
+        resources.insert(SubagentDepthCounter(1));
+        resources.insert(SessionIdResource("manager-session".to_string()));
+        resources.insert(CurrentPromptIdResource("prompt-456".to_string()));
+
+        let shared = resources.into_shared();
+        let handle = tokio::spawn(async move {
+            let request = unwrap_spawn(rx.recv().await.unwrap());
+            assert_eq!(request.subagent_type, "worker");
+            request
+                .result_tx
+                .send(SubagentResult {
+                    success: true,
+                    output: std::sync::Arc::from("worker done"),
+                    subagent_id: request.id.clone(),
+                    child_session_id: request.id.clone(),
+                    tool_calls: 1,
+                    turns: 1,
+                    duration_ms: 10,
+                    ..Default::default()
+                })
+                .unwrap();
+        });
+
+        let result = xai_tool_runtime::Tool::run(
+            &TaskTool,
+            test_ctx(shared),
+            TaskToolInput {
+                description: "nested spawn".into(),
+                prompt: "implement the change".into(),
+                subagent_type: "worker".into(),
+                run_in_background: false,
+                capability_mode: None,
+                isolation: None,
+                resume_from: None,
+                cwd: None,
+                model: None,
+                task_id: None,
+            },
+        )
+        .await;
+
+        handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "depth-1 manager must be allowed to spawn worker: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn second_level_subagent_cannot_spawn_nested_subagent() {
         let (backend, _rx) = make_backend();
         let mut resources = Resources::new();
         resources.insert(backend);
-        resources.insert(SubagentDepthCounter(1)); // first-level subagent
-        resources.insert(SessionIdResource("child-session".to_string()));
-        resources.insert(CurrentPromptIdResource("prompt-456".to_string()));
+        resources.insert(SubagentDepthCounter(2)); // worker/watcher depth
+        resources.insert(SessionIdResource("worker-session".to_string()));
+        resources.insert(CurrentPromptIdResource("prompt-789".to_string()));
 
         let result = xai_tool_runtime::Tool::run(
             &TaskTool,
@@ -567,7 +629,7 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("depth limit exceeded"),
-            "subagent at depth 1 must not spawn: {err}"
+            "subagent at depth 2 must not spawn: {err}"
         );
     }
 

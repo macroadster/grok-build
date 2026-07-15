@@ -461,6 +461,79 @@ fn orchestrator_toolset() -> ToolServerConfig {
         behavior_preset: None,
     }
 }
+/// Manager toolset: read/search/orchestration tools, no file editing.
+///
+/// The manager delegates all implementation to worker subagents and
+/// verification to watcher subagents. It retains read_file, grep,
+/// list_dir for context gathering, plus the full subagent stack for
+/// orchestration. Bash is included for quick orientation (`ls`, `git
+/// status`); the prompt still forbids using it to implement or build.
+fn manager_toolset() -> ToolServerConfig {
+    ToolServerConfig {
+        tools: vec![
+            bash_tool_config(),
+            (&grok_build::ReadFileTool).into(),
+            (&grok_build::ListDirTool).into(),
+            (&grok_build::GrepTool).into(),
+            task_tool_config(),
+            task_output_tool_config(),
+            wait_tasks_tool_config(),
+            kill_task_tool_config(),
+            (&search_tool::SearchTool).into(),
+            (&use_tool::UseTool).into(),
+            (&grok_build::TodoWriteTool).into(),
+            (&grok_build::AskUserQuestionTool).into(),
+            (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::SchedulerCreateTool).into(),
+            (&grok_build::SchedulerDeleteTool).into(),
+            (&grok_build::SchedulerListTool).into(),
+            (&grok_build::MonitorTool).into(),
+            (&grok_build::WebSearchTool).into(),
+        ],
+        behavior_preset: None,
+    }
+}
+
+/// Worker toolset: full read/write/execute tools for implementation.
+///
+/// Intentionally omits Task/spawn tools — workers execute, they do not
+/// orchestrate. Nesting is also blocked by `MAX_SUBAGENT_DEPTH` once the
+/// worker is a depth-2 child of a manager.
+fn worker_toolset() -> ToolServerConfig {
+    ToolServerConfig {
+        tools: vec![
+            bash_tool_config(),
+            (&grok_build::ReadFileTool).into(),
+            (&grok_build::SearchReplaceTool).into(),
+            (&grok_build::ListDirTool).into(),
+            (&grok_build::GrepTool).into(),
+            (&grok_build::TodoWriteTool).into(),
+            (&search_tool::SearchTool).into(),
+            (&use_tool::UseTool).into(),
+            (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::WebSearchTool).into(),
+        ],
+        behavior_preset: None,
+    }
+}
+
+/// Watcher toolset: read-only plus terminal execution for verification.
+///
+/// The watcher can read files, search, and run commands (to execute tests
+/// and linters) but CANNOT edit files (`SearchReplace` omitted). Bash is
+/// present for test/lint runs; the prompt forbids using it to mutate the tree.
+fn watcher_toolset() -> ToolServerConfig {
+    ToolServerConfig {
+        tools: vec![
+            bash_tool_config(),
+            (&grok_build::ReadFileTool).into(),
+            (&grok_build::ListDirTool).into(),
+            (&grok_build::GrepTool).into(),
+            (&grok_build::UpdateGoalTool).into(),
+        ],
+        behavior_preset: None,
+    }
+}
 /// Grok Build + plan mode toolset WITHOUT subagent tools.
 ///
 /// Same as `grok_build_plan_toolset` but excludes `TaskTool`,
@@ -654,8 +727,9 @@ where
 /// are defined in exactly one place. The enum covers all built-in
 /// agents for centralized name management and `by_name()` dispatch.
 ///
-/// `subagent_variants()` returns only the 3 that are exposed to the LLM
-/// via the `TaskTool` description. The remaining 6 are top-level agent
+/// `subagent_variants()` returns only the types exposed to the LLM via the
+/// `TaskTool` description (currently 6: general-purpose, explore, plan,
+/// manager, worker, watcher). The remaining built-ins are top-level agent
 /// profiles resolvable by name but not advertised as subagent types.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter, AsRefStr, IntoStaticStr,
@@ -675,6 +749,9 @@ pub enum BuiltinAgentName {
     BrowserUse,
     #[strum(serialize = "grok-build-orchestrator")]
     GrokBuildOrchestrator,
+    Manager,
+    Worker,
+    Watcher,
 }
 /// Strict-harness predicate by name. Resolves via `BuiltinAgentName` and
 /// delegates to [`AgentDefinition::is_strict_harness`]; unknown names
@@ -703,11 +780,21 @@ impl BuiltinAgentName {
             Self::Plan => AgentDefinition::plan(),
             Self::BrowserUse => AgentDefinition::browser_use(),
             Self::GrokBuildOrchestrator => AgentDefinition::grok_build_orchestrator(),
+            Self::Manager => AgentDefinition::manager(),
+            Self::Worker => AgentDefinition::worker(),
+            Self::Watcher => AgentDefinition::watcher(),
         }
     }
     /// Built-in agents available as subagents via the Task tool.
     pub fn subagent_variants() -> &'static [Self] {
-        &[Self::GeneralPurpose, Self::Explore, Self::Plan]
+        &[
+            Self::GeneralPurpose,
+            Self::Explore,
+            Self::Plan,
+            Self::Manager,
+            Self::Worker,
+            Self::Watcher,
+        ]
     }
 }
 /// Portable agent identity — parsed from .grok/agents/*.md.
@@ -1598,6 +1685,51 @@ impl AgentDefinition {
             )
         }
     }
+    /// Manager subagent — coordinates work by delegating to workers and watchers.
+    ///
+    /// Prefer starting a session as `manager` for user-facing orchestration, or
+    /// spawn it from the main agent (depth 1); it can then spawn worker/watcher
+    /// children (depth 2).
+    pub fn manager() -> Self {
+        use crate::prompt::subagent_prompts;
+        Self {
+            description: xai_tool_types::MANAGER_SUBAGENT
+                .description
+                .to_string(),
+            tool_config: manager_toolset(),
+            inject_default_tools: false,
+            prompt_body: Some(subagent_prompts::MANAGER_PROMPT.to_string()),
+            ..Self::base(BuiltinAgentName::Manager, "")
+        }
+    }
+    /// Worker subagent — primary task executor with full read/write/execute tools.
+    pub fn worker() -> Self {
+        use crate::prompt::subagent_prompts;
+        Self {
+            description: xai_tool_types::WORKER_SUBAGENT
+                .description
+                .to_string(),
+            tool_config: worker_toolset(),
+            inject_default_tools: false,
+            prompt_body: Some(subagent_prompts::WORKER_PROMPT.to_string()),
+            ..Self::base(BuiltinAgentName::Worker, "")
+        }
+    }
+    /// Watcher subagent — independent verifier that reviews worker output.
+    pub fn watcher() -> Self {
+        use crate::prompt::subagent_prompts;
+        Self {
+            description: xai_tool_types::WATCHER_SUBAGENT
+                .description
+                .to_string(),
+            tool_config: watcher_toolset(),
+            inject_default_tools: false,
+            permission_mode: PermissionMode::Plan,
+            prompt_body: Some(subagent_prompts::WATCHER_PROMPT.to_string()),
+            inherit_skills: false,
+            ..Self::base(BuiltinAgentName::Watcher, "")
+        }
+    }
     /// Deserialize an agent definition from a JSON value (e.g. from ACP `_meta.agentProfile`).
     ///
     /// Unlike `parse()` (which reads YAML frontmatter + Markdown body from a file),
@@ -1777,7 +1909,11 @@ mod tests {
     /// until classified.
     fn expected_strict_harness(name: BuiltinAgentName) -> bool {
         match name {
-            BuiltinAgentName::Codex | BuiltinAgentName::GrokBuildOrchestrator => true,
+            BuiltinAgentName::Codex
+            | BuiltinAgentName::GrokBuildOrchestrator
+            | BuiltinAgentName::Manager
+            | BuiltinAgentName::Worker
+            | BuiltinAgentName::Watcher => true,
             BuiltinAgentName::GrokBuild
             | BuiltinAgentName::GrokBuildConcise
             | BuiltinAgentName::GrokBuildPlan
@@ -1808,7 +1944,13 @@ mod tests {
     }
     #[test]
     fn is_strict_harness_agent_type_classifies_by_name() {
-        for strict in ["codex", "grok-build-orchestrator"] {
+        for strict in [
+            "codex",
+            "grok-build-orchestrator",
+            "manager",
+            "worker",
+            "watcher",
+        ] {
             assert!(
                 is_strict_harness_agent_type(strict),
                 "{strict} should be strict"
@@ -2460,10 +2602,43 @@ description: Test default tool config
     #[test]
     fn test_builtin_agent_name_subagent_variants() {
         let variants = BuiltinAgentName::subagent_variants();
-        assert_eq!(variants.len(), 3);
+        assert_eq!(variants.len(), 6);
         assert!(variants.contains(&BuiltinAgentName::GeneralPurpose));
         assert!(variants.contains(&BuiltinAgentName::Explore));
         assert!(variants.contains(&BuiltinAgentName::Plan));
+        assert!(variants.contains(&BuiltinAgentName::Manager));
+        assert!(variants.contains(&BuiltinAgentName::Worker));
+        assert!(variants.contains(&BuiltinAgentName::Watcher));
+    }
+    #[test]
+    fn manager_worker_watcher_toolsets_are_role_differentiated() {
+        let manager = AgentDefinition::manager();
+        let worker = AgentDefinition::worker();
+        let watcher = AgentDefinition::watcher();
+
+        assert!(!manager.inject_default_tools);
+        assert!(!worker.inject_default_tools);
+        assert!(!watcher.inject_default_tools);
+
+        let task_id = ToolConfig::from(&grok_build::TaskTool).id;
+        let edit_id = ToolConfig::from(&grok_build::SearchReplaceTool).id;
+        let bash_id = bash_tool_config().id;
+
+        let has = |def: &AgentDefinition, id: &str| def.tool_config.tools.iter().any(|t| t.id == id);
+
+        // Manager: orchestrates (has Task), cannot edit files.
+        assert!(has(&manager, &task_id), "manager must have Task");
+        assert!(!has(&manager, &edit_id), "manager must not have SearchReplace");
+
+        // Worker: executes (has edit), does not orchestrate (no Task).
+        assert!(has(&worker, &edit_id), "worker must have SearchReplace");
+        assert!(!has(&worker, &task_id), "worker must not have Task");
+
+        // Watcher: verify only — bash + read/search, no edit, no Task.
+        assert!(has(&watcher, &bash_id), "watcher must have bash");
+        assert!(!has(&watcher, &edit_id), "watcher must not have SearchReplace");
+        assert!(!has(&watcher, &task_id), "watcher must not have Task");
+        assert_eq!(watcher.permission_mode, PermissionMode::Plan);
     }
     #[test]
     fn test_all_builtins_have_inherit_model() {
