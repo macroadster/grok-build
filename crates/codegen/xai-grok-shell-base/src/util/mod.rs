@@ -53,11 +53,23 @@ fn matches_trusted_base_url(candidate: &str, trusted_base: &str) -> bool {
         && candidate.port_or_known_default() == trusted.port_or_known_default()
         && path_matches
 }
-/// True for cli-chat-proxy URLs (production, plus local-dev hosts when the
-/// optional non-production feature is enabled). When that feature is on,
-/// runtime env overrides can extend this trust set.
+/// True for cli-chat-proxy URLs: the compiled production default, plus any
+/// runtime override from `GROK_CLI_CHAT_PROXY_BASE_URL` or the env-preset
+/// resolver (`GROK_PRODUCTION_CLI_CHAT_PROXY_BASE_URL`). Overrides let local
+/// mock servers and enterprise proxies participate in first-party URL checks.
 pub fn is_cli_chat_proxy_url(url: &str) -> bool {
     if matches_trusted_base_url(url, crate::env::PROD_CLI_CHAT_PROXY_BASE_URL) {
+        return true;
+    }
+    if let Ok(override_url) = std::env::var("GROK_CLI_CHAT_PROXY_BASE_URL") {
+        if !override_url.is_empty() && matches_trusted_base_url(url, &override_url) {
+            return true;
+        }
+    }
+    let resolved = crate::env::GrokBuildEnvironment::default().cli_chat_proxy_base_url();
+    if resolved != crate::env::PROD_CLI_CHAT_PROXY_BASE_URL
+        && matches_trusted_base_url(url, &resolved)
+    {
         return true;
     }
     false
@@ -227,6 +239,43 @@ mod tests {
     fn test_is_cli_chat_proxy_url_rejects_v11_prefix_confusion() {
         assert!(!is_cli_chat_proxy_url(
             "https://cli-chat-proxy.grok.com/v11/chat/completions"
+        ));
+    }
+    #[test]
+    fn test_is_cli_chat_proxy_url_rejects_local_without_override() {
+        let _guard = crate::env::EnvVarGuard::remove("GROK_CLI_CHAT_PROXY_BASE_URL");
+        assert!(!is_cli_chat_proxy_url("http://127.0.0.1:9999/v1"));
+        assert!(!is_cli_chat_proxy_url("http://127.0.0.1:9999/v1/models-v2"));
+    }
+    #[test]
+    fn test_is_cli_chat_proxy_url_accepts_env_override() {
+        let _guard = crate::env::EnvVarGuard::set(
+            "GROK_CLI_CHAT_PROXY_BASE_URL",
+            "http://127.0.0.1:9999/v1",
+        );
+        assert!(is_cli_chat_proxy_url("http://127.0.0.1:9999/v1"));
+        assert!(is_cli_chat_proxy_url(
+            "http://127.0.0.1:9999/v1/models-v2"
+        ));
+        // Unrelated hosts stay untrusted even with an override set.
+        assert!(!is_cli_chat_proxy_url("https://api.x.ai/v1"));
+        assert!(!is_cli_chat_proxy_url(
+            "https://cli-chat-proxy.grok.com.evil.example/v1"
+        ));
+    }
+    #[test]
+    fn test_is_cli_chat_proxy_url_accepts_production_env_preset_override() {
+        let _guard = crate::env::EnvVarGuard::set(
+            "GROK_PRODUCTION_CLI_CHAT_PROXY_BASE_URL",
+            "https://grok-proxy.acme.com/v1",
+        );
+        assert!(is_cli_chat_proxy_url("https://grok-proxy.acme.com/v1"));
+        assert!(is_cli_chat_proxy_url(
+            "https://grok-proxy.acme.com/v1/chat/completions"
+        ));
+        // Production default remains trusted.
+        assert!(is_cli_chat_proxy_url(
+            "https://cli-chat-proxy.grok.com/v1/chat/completions"
         ));
     }
     #[test]

@@ -52,7 +52,38 @@ const fn const_str_eq(a: &str, b: &str) -> bool {
 }
 /// Run `f` over the trusted key set — the compiled-in [`EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS`],
 /// unless the compile-time-excluded test seam overrides it.
+#[cfg(feature = "test-support")]
+pub mod test_seam {
+    use std::sync::{Mutex, OnceLock};
+
+    static OVERRIDE: OnceLock<Mutex<Option<Vec<(&'static str, &'static [u8])>>>> = OnceLock::new();
+
+    fn cell() -> &'static Mutex<Option<Vec<(&'static str, &'static [u8])>>> {
+        OVERRIDE.get_or_init(|| Mutex::new(None))
+    }
+
+    pub fn set_embedded_keys(keys: &[(&str, &[u8])]) {
+        let owned: Vec<(&'static str, &'static [u8])> = keys
+            .iter()
+            .map(|(id, k)| {
+                let id: &'static str = Box::leak((*id).to_owned().into_boxed_str());
+                let k: &'static [u8] = Box::leak((*k).to_vec().into_boxed_slice());
+                (id, k)
+            })
+            .collect();
+        *cell().lock().unwrap_or_else(|p| p.into_inner()) = Some(owned);
+    }
+
+    pub(super) fn override_keys() -> Option<Vec<(&'static str, &'static [u8])>> {
+        cell().lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+}
+
 fn with_embedded_keys<R>(f: impl FnOnce(&[(&str, &[u8])]) -> R) -> R {
+    #[cfg(feature = "test-support")]
+    if let Some(keys) = test_seam::override_keys() {
+        return f(&keys);
+    }
     f(EMBEDDED_DEPLOYMENT_CONFIG_PUBKEYS)
 }
 /// Sidecar persisted next to the policy so the load-time gate can re-verify it offline.

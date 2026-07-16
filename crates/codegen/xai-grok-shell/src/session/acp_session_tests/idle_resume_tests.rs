@@ -64,6 +64,10 @@ async fn test_e2e_idle_resume_refreshes_model_metadata() {
             let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
             let addr = listener.local_addr().unwrap();
             let mock_url = format!("http://{}/v1", addr);
+            // Trust the local mock as cli-chat-proxy so idle-resume metadata
+            // refresh is not skipped by is_cli_chat_proxy_url.
+            let _proxy_env =
+                crate::env::EnvVarGuard::set("GROK_CLI_CHAT_PROXY_BASE_URL", &mock_url);
             tokio::task::spawn_local(async move {
                 axum::serve(listener, app).await.unwrap();
             });
