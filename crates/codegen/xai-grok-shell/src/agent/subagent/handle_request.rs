@@ -383,11 +383,17 @@ pub(crate) async fn run_shell_child(
     let tools_before_policy = definition.tool_config.tools.len();
     let allow_nested_subagents =
         child_depth < xai_grok_tools::implementations::grok_build::task::MAX_SUBAGENT_DEPTH;
+    // apply_child_tool_policy filters via capability mode (which also runs
+    // satisfy_background_bash_dependencies). When no mode is set, still ensure
+    // background bash + companions form a valid graph.
     xai_grok_subagent_resolution::apply_child_tool_policy(
         &mut definition,
         effective_runtime.capability_mode,
         allow_nested_subagents,
     );
+    if effective_runtime.capability_mode.is_none() {
+        satisfy_background_bash_dependencies(&mut definition.tool_config);
+    }
     if let Some(mode) = effective_runtime.capability_mode {
         tracing::info!(
             subagent_id = %request.id,
@@ -1295,6 +1301,11 @@ pub(crate) async fn run_shell_child(
                         success: false,
                         cancelled: true,
                         error: Some(reason),
+                        failure_class: Some(SubagentFailureClass::Cancelled),
+                        failure_hint: Some(failure_hint_for(
+                            SubagentFailureClass::Cancelled,
+                            "cancelled",
+                        )),
                         output: if final_text.is_empty() {
                             std::sync::Arc::from(format!(
                                 "Subagent '{}' ({}) was cancelled. {} tool calls, {} turns.",
@@ -1325,6 +1336,11 @@ pub(crate) async fn run_shell_child(
                     success: false,
                     cancelled: true,
                     error: Some(format!("max turns reached (limit: {limit})")),
+                    failure_class: Some(SubagentFailureClass::Timeout),
+                    failure_hint: Some(failure_hint_for(
+                        SubagentFailureClass::Timeout,
+                        "max turns",
+                    )),
                     output: if final_text.is_empty() {
                         std::sync::Arc::from(format!(
                             "Subagent '{}' ({}) hit max-turns limit ({limit}). {} tool calls, {} turns.",
@@ -1442,6 +1458,10 @@ pub(crate) async fn run_shell_child(
             }
         }
     };
+    // Attach failure taxonomy for parent-facing errors (spawn/task/timeout/cancel).
+    if !result.success && result.failure_class.is_none() {
+        result = result.with_classified_error(&request.subagent_type);
+    }
     if let Some(trace_gcs_config) = gcs_upload_ctx.upload_method.as_ref().map(|method| {
         crate::session::repo_changes::TraceExportConfig {
             bucket_url: gcs_upload_ctx.bucket_url.clone(),

@@ -1882,6 +1882,7 @@ fn failure_result(request: &SubagentRequest, error: &str) -> SubagentResult {
         child_session_id: request.id.clone(),
         ..Default::default()
     }
+    .with_classified_error(&request.subagent_type)
 }
 fn cancelled_result(request: &SubagentRequest, error: &str) -> SubagentResult {
     SubagentResult {
@@ -1892,6 +1893,7 @@ fn cancelled_result(request: &SubagentRequest, error: &str) -> SubagentResult {
         child_session_id: request.id.clone(),
         ..Default::default()
     }
+    .with_classified_error(&request.subagent_type)
 }
 fn child_run_output(
     result: SubagentResult,
@@ -1920,7 +1922,8 @@ fn fail_subagent(
         child_session_id: child_session_id.0.to_string(),
         duration_ms,
         ..Default::default()
-    };
+    }
+    .with_classified_error(subagent_id);
     persist_subagent_completion(subagent_meta_dir, &result, gcs_ctx);
     result
 }

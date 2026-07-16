@@ -577,20 +577,23 @@ fn format_subagent_snapshot(snap: &SubagentSnapshot) -> TaskOutputOutput {
             turns,
             worktree_path,
         } => {
-            let mut output = format!(
-                "{output}\n\n<subagent_meta>id={}, type={}, tool_calls={tool_calls}, \
-                 turns={turns}, duration_ms={}</subagent_meta>",
-                snap.subagent_id, snap.subagent_type, snap.duration_ms,
-            );
-            if let Some(wt) = &worktree_path {
-                output.push_str(&format!("\n<worktree_path>{wt}</worktree_path>"));
-            }
-            output.push_str("\n\n");
-            output.push_str(&xai_tool_types::format_resume_footer(
+            let mut output = xai_tool_types::format_subagent_completed(
+                &output,
                 &snap.subagent_id,
                 &snap.subagent_type,
+                *tool_calls,
+                *turns,
+                snap.duration_ms,
                 snap.persona.as_deref(),
-            ));
+            );
+            if let Some(wt) = &worktree_path {
+                // Insert worktree path before the resume footer for discoverability.
+                if let Some(idx) = output.rfind("<subagent_result>") {
+                    output.insert_str(idx, &format!("<worktree_path>{wt}</worktree_path>\n\n"));
+                } else {
+                    output.push_str(&format!("\n<worktree_path>{wt}</worktree_path>"));
+                }
+            }
             let raw_output_bytes = output.len();
             TaskOutputOutput::Result(TaskOutputResult {
                 task_id: snap.subagent_id.clone(),

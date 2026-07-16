@@ -8,6 +8,18 @@ Grok runs long-lived processes without blocking the conversation. This document 
 
 Set `background: true` on the `run_terminal_command` tool to run a command in the background. It returns a task ID immediately; retrieve output with `get_command_or_subagent_output`.
 
+### Tool dependency (same agent)
+
+Background bash is only valid when the **same** agent also has observe and cancel tools:
+
+| Tool | Role |
+|------|------|
+| `run_terminal_command` with background enabled (default) | Start background commands |
+| `get_command_or_subagent_output` | Poll / wait for output |
+| `kill_command_or_subagent` | Cancel a running task |
+
+Role toolsets that enable background shell (worker, watcher, manager, general-purpose) include these companions. If companions are missing after capability filtering or a custom toolset, Grok Build **disables background** on bash rather than failing agent spawn with an opaque requirements error.
+
 ### How It Works
 
 1. The agent calls `run_terminal_command` with `background: true`.
