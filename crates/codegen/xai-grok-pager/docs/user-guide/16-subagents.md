@@ -60,10 +60,26 @@ The `spawn_subagent` tool accepts a `subagent_type` parameter that selects the c
 | Type              | Description                                          |
 | ----------------- | ---------------------------------------------------- |
 | `general-purpose` | Default type. Full-capability agent for any task.    |
-| `explore`         | Research agent. Searches, reads, greps, and runs shell commands, but does not edit files. Use it for codebase investigation. |
+| `explore`         | Research agent. Searches, reads, and greps, but does not edit files or run shell. Use it for codebase investigation. |
 | `plan`            | Planning agent. Explores the codebase and produces a structured implementation plan; does not edit files. |
+| `manager`         | Orchestrator. Clarifies requirements, delegates implement work to **worker** subagents and verification to **watcher** subagents. Does not edit files itself. |
+| `worker`          | Primary implementer. Reads, writes, builds, and tests. Prefer this over `general-purpose` for implementation tasks. |
+| `watcher`         | Independent verifier. Reads and runs tests/linters; does not edit files. Reports PASS/FAIL against acceptance criteria. |
 
 Project- or user-defined agents can add new types or shadow these built-ins by name.
+
+### Worker / manager / watcher orchestration
+
+Prefer this pattern for multi-step work:
+
+1. **Manager** (or the main agent) decomposes the task.
+2. **Workers** implement in parallel, writing **partial artifacts** to disk early (paths listed in the completion summary).
+3. A **merge worker** with `capability_mode: read-write` combines partials into a final file (no shell needed).
+4. A **watcher** verifies acceptance criteria.
+
+**Do not** paste full file bodies from one child into the next spawn prompt — pass paths and acceptance criteria; workers `read_file` themselves.
+
+For parallel implementers that edit the same repo, prefer `isolation: worktree`.
 
 ---
 
@@ -155,6 +171,21 @@ The main agent calls the `spawn_subagent` tool. Its parameters:
 
 When you run a subagent in the background, retrieve its result later with `get_command_or_subagent_output`.
 
+### Spawn failure classes
+
+When a spawn or child run fails, the parent sees a classified message:
+
+| `failure_class` | Meaning | What to do |
+|-----------------|---------|------------|
+| `spawn_tool_graph` | Agent toolset could not be built (e.g. broken bash lifecycle) | Prefer default `worker` toolset; use `read-write` for no-shell file work |
+| `spawn_depth` | Nested subagent forbidden | Only manager → worker/watcher; no further nesting |
+| `spawn_config` | Unknown type, bad persona, cwd, or model | Fix `subagent_type` / persona / paths |
+| `task_error` | Child ran but failed | Re-delegate with a fix prompt |
+| `timeout` | Child exceeded time or turn limit | Narrow the task or `resume_from` |
+| `cancelled` | Parent or user killed the child | Re-spawn; partial on-disk artifacts may still be usable |
+
+Completion payloads include runtime metrics (`tool_calls`, `turns`, `duration_ms`, `status`) so parents can track work without parsing free-form prose. Workers are also instructed to report `artifacts`, `commands_run`, and `status` in their summary.
+
 ---
 
 ## Capability Modes
@@ -168,7 +199,24 @@ A capability mode is an optional, coarse filter on a subagent's tools:
 | `execute`    | Yes  | No    | Yes     | Read, plus run shell commands and background tasks. No file edits. |
 | `all`        | Yes  | Yes   | Yes     | Unrestricted tool access.                    |
 
-If you omit `capability_mode`, the subagent uses its agent type's toolset. The built-in `explore` and `plan` types read, search, and run shell commands but cannot edit files; `general-purpose` ships the full toolset.
+If you omit `capability_mode`, the subagent uses its agent type's toolset:
+
+| Type | Default tools (no capability_mode) |
+|------|-------------------------------------|
+| `general-purpose` | Full toolset (read, write, execute, orchestration) |
+| `worker` | Implement toolset: read, write, execute (background shell + observe/cancel companions); no nested spawn |
+| `manager` | Read, search, execute (orientation), spawn/observe/kill; no file edits |
+| `watcher` | Read, search, execute (tests/linters); no file edits |
+| `explore` / `plan` | Read and search only (no shell, no edits) |
+
+**Worker tips**
+
+- Omit `capability_mode` or use `all` for full implement work (edit + build + test).
+- Use `read-write` for pure file generation or merge without shell.
+- Use `execute` for test/build-only runs without edits.
+- Use `read-only` for investigation-only slices.
+
+Capability filtering recomputes the bash tool graph: modes without execute drop shell; modes with execute keep background shell only when observe/cancel companions remain.
 
 ---
 

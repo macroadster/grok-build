@@ -274,6 +274,10 @@ pub fn format_subagent_started_background(
 /// Render the full model-facing completion block for a finished subagent:
 /// the answer text, a `<subagent_meta>` line carrying run stats, and the
 /// `<subagent_result>` resume footer.
+///
+/// Runtime-derived metrics (`tool_calls`, `turns`, `duration_ms`, `status`) are
+/// always present so parents can key off structured fields even when the child
+/// model forgets the artifact-first completion contract.
 pub fn format_subagent_completed(
     output: &str,
     subagent_id: &str,
@@ -283,10 +287,35 @@ pub fn format_subagent_completed(
     duration_ms: u64,
     persona: Option<&str>,
 ) -> String {
+    format_subagent_completed_with_status(
+        output,
+        subagent_id,
+        subagent_type,
+        tool_calls,
+        turns,
+        duration_ms,
+        persona,
+        "success",
+    )
+}
+
+/// Like [`format_subagent_completed`] but with an explicit status
+/// (`success` | `partial` | `failed` | `cancelled`).
+pub fn format_subagent_completed_with_status(
+    output: &str,
+    subagent_id: &str,
+    subagent_type: &str,
+    tool_calls: u32,
+    turns: u32,
+    duration_ms: u64,
+    persona: Option<&str>,
+    status: &str,
+) -> String {
     let footer = format_resume_footer(subagent_id, subagent_type, persona);
     format!(
         "{output}\n\n<subagent_meta>id={subagent_id}, type={subagent_type}, \
-         tool_calls={tool_calls}, turns={turns}, duration_ms={duration_ms}</subagent_meta>\n\n\
+         status={status}, tool_calls={tool_calls}, turns={turns}, \
+         duration_ms={duration_ms}</subagent_meta>\n\n\
          {footer}"
     )
 }
@@ -831,12 +860,19 @@ to verify the results.
 - You MUST NOT edit files or run builds yourself — always delegate to a **worker**.
 - You MUST NOT verify work yourself — always delegate to a **watcher**.
 - Provide each subagent with clear context: what to do, why, relevant file paths, and acceptance criteria.
+- Prefer thin spawn prompts (paths + acceptance criteria). Workers read files themselves — \
+do not paste full file bodies into the next spawn.
 - Launch independent tasks in parallel; sequence dependent ones.
+- For multi-worker fan-out: N workers write partial artifacts → one `read-write` worker merges \
+→ one watcher verifies. Prefer `isolation: worktree` when parallel implementers edit the same repo.
+- Prefer `worker` for implement/write tasks (not `general-purpose` fallbacks). Use \
+`capability_mode: read-write` for pure file merges without shell, or omit mode / use `all` for full implement.
 
 ## Communication Style
 - Be concise and action-oriented with the user.
 - When reporting results, summarize what was done and highlight any issues flagged by watchers.
-- If a watcher rejects work, re-delegate to a worker with the watcher's feedback.";
+- If a watcher rejects work, re-delegate to a worker with the watcher's feedback.
+- Key off worker `artifacts` paths and structured completion fields rather than re-parsing prose.";
 
 /// Prompt body for the **worker** subagent.
 ///
@@ -850,19 +886,33 @@ You are a **worker** agent — the primary task executor.
 - Execute the task described in your prompt thoroughly and completely.
 - Write, edit, and create files as needed.
 - Run builds, tests, linters, and any commands necessary to validate your work.
-- Return a clear summary of what you did, which files changed, and any issues encountered.
+- Prefer writing results to agreed on-disk paths; the parent merges artifacts \
+instead of re-pasting full file bodies into the next spawn.
 ${%- if tools.by_kind.edit %}
 
 ## File Editing Rules
 - NEVER create files unless absolutely necessary. Prefer editing existing files.
-- NEVER create documentation files (*.md) unless explicitly requested.\
+- NEVER create documentation files (*.md) unless explicitly requested.
+- For long multi-part work, write intermediate partials early \
+(e.g. `answers-partial-001-020.md`), then the final path. Partials survive cancel.\
 ${%- endif %}
 
 ## Quality Standards
 - Follow existing code patterns and conventions found in the codebase.
+${%- if tools.by_kind.execute %}
 - Run tests after making changes using ${{ tools.by_kind.execute }}.
+${%- endif %}
 - Use ${{ tools.by_kind.search }} and ${{ tools.by_kind.read }} to understand existing patterns before editing.
-- Include absolute file paths and relevant code snippets in your final response.
+
+## Completion contract
+On completion, always report (keep the prose summary ≤20 lines):
+- **summary**: what you did
+- **artifacts**: list of paths created or updated
+- **commands_run**: `[{cmd, exit_code}]` if you ran any
+- **status**: `success` | `partial` | `failed`
+- **next_hints**: optional bullets for the parent (merge steps, remaining work)
+
+The runtime also records tool_calls and duration_ms automatically.
 
 Workspace boundary:
 - Default scope is the workspace in <user_info>. Stay within it unless told otherwise.
@@ -1362,6 +1412,39 @@ mod tests {
         );
         assert!(desc.contains("Isolation mode:"));
         assert!(desc.contains("Use isolation to control the child's execution environment."));
+    }
+
+    #[test]
+    fn worker_prompt_includes_completion_contract() {
+        assert!(
+            WORKER_PROMPT.contains("artifacts"),
+            "worker prompt must require artifacts in completion contract"
+        );
+        assert!(
+            WORKER_PROMPT.contains("status"),
+            "worker prompt must require status in completion contract"
+        );
+        assert!(
+            WORKER_PROMPT.contains("Completion contract"),
+            "worker prompt must include the completion contract section"
+        );
+    }
+
+    #[test]
+    fn format_subagent_completed_includes_status_and_metrics() {
+        let text = format_subagent_completed(
+            "Wrote answers.md",
+            "sub-1",
+            "worker",
+            5,
+            2,
+            95800,
+            None,
+        );
+        assert!(text.contains("status=success"));
+        assert!(text.contains("tool_calls=5"));
+        assert!(text.contains("duration_ms=95800"));
+        assert!(text.contains("subagent_id: sub-1"));
     }
 
     #[test]

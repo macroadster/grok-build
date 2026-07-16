@@ -433,12 +433,17 @@ pub(crate) async fn handle_subagent_request(
         definition.capability_mode,
     );
     if let Some(mode) = effective_runtime.capability_mode {
+        // Filters tools and runs satisfy_background_bash_dependencies.
         mode.filter_tool_config(&mut definition.tool_config);
         tracing::info!(
             subagent_id = % request.id, capability_mode = ? mode, tools_remaining =
             definition.tool_config.tools.len(),
             "Applied capability mode filter to agent tool config"
         );
+    } else {
+        // No capability filter — still ensure background bash + companions
+        // form a valid graph (safe-degrade if a custom role is half-configured).
+        satisfy_background_bash_dependencies(&mut definition.tool_config);
     }
     let child_depth = request
         .runtime_overrides
@@ -1525,6 +1530,11 @@ pub(crate) async fn handle_subagent_request(
                         success: false,
                         cancelled: true,
                         error: Some(reason),
+                        failure_class: Some(SubagentFailureClass::Cancelled),
+                        failure_hint: Some(failure_hint_for(
+                            SubagentFailureClass::Cancelled,
+                            "cancelled",
+                        )),
                         output: if final_text.is_empty() {
                             std::sync::Arc::from(
                                 format!(
@@ -1565,6 +1575,11 @@ pub(crate) async fn handle_subagent_request(
                         success: false,
                         cancelled: true,
                         error: Some(format!("max turns reached (limit: {limit})")),
+                        failure_class: Some(SubagentFailureClass::Timeout),
+                        failure_hint: Some(failure_hint_for(
+                            SubagentFailureClass::Timeout,
+                            "max turns",
+                        )),
                         output: if final_text.is_empty() {
                             std::sync::Arc::from(
                                 format!(
@@ -1707,6 +1722,10 @@ pub(crate) async fn handle_subagent_request(
             }
         }
     };
+    // Attach failure taxonomy for parent-facing errors (spawn/task/timeout/cancel).
+    if !result.success && result.failure_class.is_none() {
+        result = result.with_classified_error(&request.subagent_type);
+    }
     if let Some(trace_gcs_config) = gcs_upload_ctx
         .upload_method
         .as_ref()

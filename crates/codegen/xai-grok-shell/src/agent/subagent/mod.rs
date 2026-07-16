@@ -2113,11 +2113,14 @@ fn inject_subagent_completed_prompt(
 /// Post-`insert_pending`, pre-`SubagentSpawned` failure: just send via oneshot;
 /// `PendingGuard::drop` handles the queue side effects.
 pub(crate) fn send_failure(request: SubagentRequest, error: &str) {
-    let _ = request.result_tx.send(SubagentResult {
+    let result = SubagentResult {
         success: false,
         error: Some(error.to_string()),
+        subagent_id: request.id.clone(),
         ..Default::default()
-    });
+    }
+    .with_classified_error(&request.subagent_type);
+    let _ = request.result_tx.send(result);
 }
 fn send_pre_spawn_cancelled(request: SubagentRequest, error: &str) {
     let _ = request.result_tx.send(SubagentResult {
@@ -2152,8 +2155,8 @@ fn send_pre_spawn_failure(
     if run_in_background {
         let notification_subagent_id = id.clone();
         coordinator.borrow_mut().record_pre_spawn_failure(
-            id,
-            subagent_type,
+            id.clone(),
+            subagent_type.clone(),
             description,
             parent_prompt_id,
             ctx.parent_session_id.clone(),
@@ -2179,11 +2182,14 @@ fn send_pre_spawn_failure(
             ctx.parent_cmd_tx.as_ref(),
         );
     }
-    let _ = result_tx.send(SubagentResult {
+    let result = SubagentResult {
         success: false,
         error: Some(error.to_string()),
+        subagent_id: id,
         ..Default::default()
-    });
+    }
+    .with_classified_error(&subagent_type);
+    let _ = result_tx.send(result);
 }
 /// Post-`SubagentSpawned` failure: oneshot + `SubagentFinished` + `meta.json` update.
 fn fail_subagent(
@@ -2205,7 +2211,8 @@ fn fail_subagent(
         child_session_id: child_session_id.0.to_string(),
         duration_ms,
         ..Default::default()
-    };
+    }
+    .with_classified_error(&request.subagent_type);
     persist_subagent_completion(subagent_meta_dir, &result, gcs_ctx);
     emit_subagent_notification(
         gateway,

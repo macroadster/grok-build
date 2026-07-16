@@ -499,6 +499,10 @@ fn manager_toolset() -> ToolServerConfig {
 /// Intentionally omits Task/spawn tools — workers execute, they do not
 /// orchestrate. Nesting is also blocked by `MAX_SUBAGENT_DEPTH` once the
 /// worker is a depth-2 child of a manager.
+///
+/// Background bash requires companion observe/cancel tools on the **same**
+/// agent (`get_task_output` + `kill_task`). Include them whenever bash is
+/// present with `enabled_background=true` (the default).
 fn worker_toolset() -> ToolServerConfig {
     ToolServerConfig {
         tools: vec![
@@ -507,6 +511,9 @@ fn worker_toolset() -> ToolServerConfig {
             (&grok_build::SearchReplaceTool).into(),
             (&grok_build::ListDirTool).into(),
             (&grok_build::GrepTool).into(),
+            // Bash lifecycle companions — required when background shell is enabled.
+            task_output_tool_config(),
+            kill_task_tool_config(),
             (&grok_build::TodoWriteTool).into(),
             (&search_tool::SearchTool).into(),
             (&use_tool::UseTool).into(),
@@ -522,6 +529,8 @@ fn worker_toolset() -> ToolServerConfig {
 /// The watcher can read files, search, and run commands (to execute tests
 /// and linters) but CANNOT edit files (`SearchReplace` omitted). Bash is
 /// present for test/lint runs; the prompt forbids using it to mutate the tree.
+///
+/// Same background-bash companion requirement as [`worker_toolset`].
 fn watcher_toolset() -> ToolServerConfig {
     ToolServerConfig {
         tools: vec![
@@ -529,6 +538,8 @@ fn watcher_toolset() -> ToolServerConfig {
             (&grok_build::ReadFileTool).into(),
             (&grok_build::ListDirTool).into(),
             (&grok_build::GrepTool).into(),
+            task_output_tool_config(),
+            kill_task_tool_config(),
             (&grok_build::UpdateGoalTool).into(),
         ],
         behavior_preset: None,
@@ -2623,6 +2634,8 @@ description: Test default tool config
         let task_id = ToolConfig::from(&grok_build::TaskTool).id;
         let edit_id = ToolConfig::from(&grok_build::SearchReplaceTool).id;
         let bash_id = bash_tool_config().id;
+        let task_output_id = task_output_tool_config().id;
+        let kill_task_id = kill_task_tool_config().id;
 
         let has = |def: &AgentDefinition, id: &str| def.tool_config.tools.iter().any(|t| t.id == id);
 
@@ -2633,12 +2646,115 @@ description: Test default tool config
         // Worker: executes (has edit), does not orchestrate (no Task).
         assert!(has(&worker, &edit_id), "worker must have SearchReplace");
         assert!(!has(&worker, &task_id), "worker must not have Task");
+        // Background bash lifecycle companions required for valid tool graph.
+        assert!(
+            has(&worker, &bash_id),
+            "worker must have bash for implement work"
+        );
+        assert!(
+            has(&worker, &task_output_id),
+            "worker must have get_task_output companion for background bash"
+        );
+        assert!(
+            has(&worker, &kill_task_id),
+            "worker must have kill_task companion for background bash"
+        );
 
         // Watcher: verify only — bash + read/search, no edit, no Task.
         assert!(has(&watcher, &bash_id), "watcher must have bash");
+        assert!(
+            has(&watcher, &task_output_id),
+            "watcher must have get_task_output companion for background bash"
+        );
+        assert!(
+            has(&watcher, &kill_task_id),
+            "watcher must have kill_task companion for background bash"
+        );
         assert!(!has(&watcher, &edit_id), "watcher must not have SearchReplace");
         assert!(!has(&watcher, &task_id), "watcher must not have Task");
         assert_eq!(watcher.permission_mode, PermissionMode::Plan);
+    }
+
+    #[test]
+    fn worker_and_watcher_toolsets_satisfy_background_bash_requirements() {
+        use xai_grok_tools::registry::types::ToolRegistryBuilder;
+
+        let builder = ToolRegistryBuilder::new();
+        for (label, def) in [
+            ("worker", AgentDefinition::worker()),
+            ("watcher", AgentDefinition::watcher()),
+            ("manager", AgentDefinition::manager()),
+        ] {
+            let errors = builder.validate_config(&def.tool_config);
+            assert!(
+                errors.is_empty(),
+                "{label} toolset must satisfy tool requirements: {errors:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn worker_capability_modes_produce_valid_tool_graphs() {
+        use xai_grok_tools::implementations::grok_build::task::types::{
+            SubagentCapabilityModeExt, satisfy_background_bash_dependencies,
+        };
+        use xai_grok_tools::registry::types::ToolRegistryBuilder;
+        use xai_tool_types::SubagentCapabilityMode;
+
+        let builder = ToolRegistryBuilder::new();
+        for mode in [
+            None,
+            Some(SubagentCapabilityMode::ReadOnly),
+            Some(SubagentCapabilityMode::ReadWrite),
+            Some(SubagentCapabilityMode::Execute),
+            Some(SubagentCapabilityMode::All),
+        ] {
+            let mut def = AgentDefinition::worker();
+            if let Some(m) = mode {
+                m.filter_tool_config(&mut def.tool_config);
+            } else {
+                satisfy_background_bash_dependencies(&mut def.tool_config);
+            }
+            let errors = builder.validate_config(&def.tool_config);
+            assert!(
+                errors.is_empty(),
+                "worker + {mode:?} must build a valid tool graph: {errors:?}"
+            );
+
+            let has = |kind: xai_grok_tools::types::tool::ToolKind| {
+                def.tool_config
+                    .tools
+                    .iter()
+                    .any(|t| t.kind == Some(kind))
+            };
+            use xai_grok_tools::types::tool::ToolKind;
+            match mode {
+                Some(SubagentCapabilityMode::ReadOnly) => {
+                    assert!(!has(ToolKind::Edit), "read-only must not edit");
+                    assert!(!has(ToolKind::Execute), "read-only must not shell");
+                }
+                Some(SubagentCapabilityMode::ReadWrite) => {
+                    assert!(has(ToolKind::Edit), "read-write must edit");
+                    assert!(!has(ToolKind::Execute), "read-write must not shell");
+                }
+                Some(SubagentCapabilityMode::Execute) => {
+                    assert!(!has(ToolKind::Edit), "execute must not edit");
+                    assert!(has(ToolKind::Execute), "execute must shell");
+                    assert!(
+                        has(ToolKind::BackgroundTaskAction) && has(ToolKind::KillTaskAction),
+                        "execute with background bash needs companions"
+                    );
+                }
+                Some(SubagentCapabilityMode::All) | None => {
+                    assert!(has(ToolKind::Edit), "default/all worker must edit");
+                    assert!(has(ToolKind::Execute), "default/all worker must shell");
+                    assert!(
+                        has(ToolKind::BackgroundTaskAction) && has(ToolKind::KillTaskAction),
+                        "default/all worker needs bash companions"
+                    );
+                }
+            }
+        }
     }
     #[test]
     fn test_all_builtins_have_inherit_model() {

@@ -210,6 +210,60 @@ pub fn prune_orphaned_background_task_tools(config: &mut crate::registry::types:
     });
 }
 
+/// Ensure background bash and its observe/cancel companions form a valid tool
+/// graph after capability filtering or custom toolset assembly.
+///
+/// **Strategy (preferred for capability-constrained / policy-stripped sets):**
+/// if `enabled_background=true` on bash but companions are missing, disable
+/// background shell rather than fail agent build. Role definitions that intend
+/// full implement+background should include companions explicitly (see
+/// `worker_toolset` / `watcher_toolset`).
+///
+/// Call this **after** capability filtering so stripped companions cannot leave
+/// a half-enabled shell. Prefer auto-include at role definition time; this is
+/// the safe degrade path.
+pub fn satisfy_background_bash_dependencies(
+    config: &mut crate::registry::types::ToolServerConfig,
+) {
+    use crate::types::tool::ToolKind;
+
+    let has_observe = config
+        .tools
+        .iter()
+        .any(|tc| tc.kind == Some(ToolKind::BackgroundTaskAction));
+    let has_kill = config
+        .tools
+        .iter()
+        .any(|tc| tc.kind == Some(ToolKind::KillTaskAction));
+    if has_observe && has_kill {
+        return;
+    }
+
+    let mut disabled_any = false;
+    for tc in &mut config.tools {
+        if !is_background_capable_bash_tool(tc) {
+            continue;
+        }
+        // OpenCode:bash is always background-capable with no param to clear;
+        // leave it alone (it does not participate in GrokBuild requirements).
+        if tc.id == "OpenCode:bash" {
+            continue;
+        }
+        let params = tc.params.get_or_insert_with(Default::default);
+        params.insert("enabled_background".into(), false.into());
+        params.insert("auto_background_on_timeout".into(), false.into());
+        disabled_any = true;
+    }
+    if disabled_any {
+        tracing::warn!(
+            "Disabled background shell: enabled_background=true requires get_task_output \
+             and kill_task on the same agent; companions were missing so background was \
+             turned off to allow spawn"
+        );
+        prune_orphaned_background_task_tools(config);
+    }
+}
+
 fn is_background_capable_bash_tool(tc: &crate::registry::types::ToolConfig) -> bool {
     match tc.id.as_str() {
         "GrokBuild:run_terminal_cmd" | "GrokBuildConcise:run_terminal_cmd" => tc
@@ -225,15 +279,17 @@ fn is_background_capable_bash_tool(tc: &crate::registry::types::ToolConfig) -> b
 
 impl SubagentCapabilityModeExt for SubagentCapabilityMode {
     fn filter_tool_config(self, config: &mut crate::registry::types::ToolServerConfig) {
-        if self == Self::All {
-            return;
+        if self != Self::All {
+            let allowed = self.allowed_tool_kinds();
+            config.tools.retain(|tc| match tc.kind {
+                Some(k) => allowed.contains(&k),
+                None => true,
+            });
+            prune_orphaned_background_task_tools(config);
         }
-        let allowed = self.allowed_tool_kinds();
-        config.tools.retain(|tc| match tc.kind {
-            Some(k) => allowed.contains(&k),
-            None => true,
-        });
-        prune_orphaned_background_task_tools(config);
+        // Always recompute bash background flags after filtering so a mode
+        // that strips companions cannot leave a half-enabled shell graph.
+        satisfy_background_bash_dependencies(config);
     }
 
     /// Return the set of `ToolKind`s allowed under this capability mode.
@@ -338,6 +394,124 @@ impl SubagentCapabilityModeExt for SubagentCapabilityMode {
     }
 }
 
+/// Classification of subagent failures returned to the parent model.
+///
+/// Keeps engineer-facing detail separate from actionable role-facing hints.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SubagentFailureClass {
+    /// Agent tool graph could not be built (e.g. background bash without companions).
+    SpawnToolGraph,
+    /// Nested subagent depth limit exceeded.
+    SpawnDepth,
+    /// Unknown type, disabled type, bad persona, or other config error.
+    SpawnConfig,
+    /// Agent ran; task failed or session error.
+    TaskError,
+    /// Agent exceeded a time / budget limit.
+    Timeout,
+    /// Parent or user cancelled the child.
+    Cancelled,
+}
+
+impl SubagentFailureClass {
+    /// Wire / model-facing snake_case name.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::SpawnToolGraph => "spawn_tool_graph",
+            Self::SpawnDepth => "spawn_depth",
+            Self::SpawnConfig => "spawn_config",
+            Self::TaskError => "task_error",
+            Self::Timeout => "timeout",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+/// Classify a raw spawn/runtime error for parent-facing reporting.
+pub fn classify_subagent_failure(error: &str) -> SubagentFailureClass {
+    let lower = error.to_ascii_lowercase();
+    if lower.contains("was cancelled") || lower.contains("cancelled by") {
+        SubagentFailureClass::Cancelled
+    } else if lower.contains("depth limit") || lower.contains("max_subagent_depth") {
+        SubagentFailureClass::SpawnDepth
+    } else if lower.contains("requirements unsatisfied")
+        || lower.contains("enabled_background")
+        || lower.contains("tool error")
+        || lower.contains("agent building failed")
+    {
+        SubagentFailureClass::SpawnToolGraph
+    } else if lower.contains("timeout") || lower.contains("timed out") || lower.contains("max turns")
+    {
+        SubagentFailureClass::Timeout
+    } else if lower.contains("unknown subagent")
+        || lower.contains("not found")
+        || lower.contains("persona")
+        || lower.contains("cannot resume")
+        || lower.contains("cwd ")
+        || lower.contains("does not exist")
+        || lower.contains("disabled")
+        || lower.contains("model")
+        || lower.contains("sampling client")
+        || lower.contains("persistence error")
+    {
+        SubagentFailureClass::SpawnConfig
+    } else {
+        SubagentFailureClass::TaskError
+    }
+}
+
+/// Short actionable hint for the parent model, derived from failure class + message.
+pub fn failure_hint_for(class: SubagentFailureClass, error: &str) -> String {
+    match class {
+        SubagentFailureClass::SpawnToolGraph => {
+            if error.contains("enabled_background") || error.contains("get_task_output") {
+                "Background shell requires get_task_output and kill_task on the same agent, \
+                 or disable background shell for this role. Prefer spawning worker with a \
+                 complete toolset (default implement worker includes companions)."
+                    .to_string()
+            } else {
+                "Agent tool graph is invalid. Check role toolset and capability_mode \
+                 (read-write has no shell; execute/all need background companions)."
+                    .to_string()
+            }
+        }
+        SubagentFailureClass::SpawnDepth => {
+            "Nested subagents are not allowed at this depth. Delegate from manager to \
+             worker/watcher only (one level of children)."
+                .to_string()
+        }
+        SubagentFailureClass::SpawnConfig => {
+            "Check subagent_type, persona, cwd, model, and role configuration."
+                .to_string()
+        }
+        SubagentFailureClass::Timeout => {
+            "Child exceeded a time or turn limit. Resume with resume_from or re-spawn \
+             with a narrower task."
+                .to_string()
+        }
+        SubagentFailureClass::Cancelled => {
+            "Child was cancelled. Re-spawn if the work is still needed; partial artifacts \
+             on disk may still be usable."
+                .to_string()
+        }
+        SubagentFailureClass::TaskError => {
+            "Child ran but failed. Read the error and re-delegate with a fix prompt."
+                .to_string()
+        }
+    }
+}
+
+/// Format a parent-facing spawn/runtime failure with class + hint + technical detail.
+pub fn format_subagent_failure_message(subagent_type: &str, error: &str) -> String {
+    let class = classify_subagent_failure(error);
+    let hint = failure_hint_for(class, error);
+    format!(
+        "{subagent_type} spawn/run failed (failure_class={}): {hint}\n\
+         technical_detail: {error}",
+        class.as_str()
+    )
+}
+
 /// Result returned by a completed subagent.
 #[derive(Debug, Clone)]
 pub struct SubagentResult {
@@ -351,6 +525,10 @@ pub struct SubagentResult {
     pub output: Arc<str>,
     /// Error message if the subagent failed.
     pub error: Option<String>,
+    /// Structured failure class for parent routing (spawn vs task vs cancel).
+    pub failure_class: Option<SubagentFailureClass>,
+    /// Short actionable hint for the parent model.
+    pub failure_hint: Option<String>,
     /// True if the subagent was cancelled (by user or model).
     /// Distinct from failure — cancellation is intentional.
     pub cancelled: bool,
@@ -379,6 +557,8 @@ impl Default for SubagentResult {
             success: false,
             output: Arc::from(""),
             error: None,
+            failure_class: None,
+            failure_hint: None,
             cancelled: false,
             subagent_id: String::new(),
             child_session_id: String::new(),
@@ -405,6 +585,22 @@ impl SubagentResult {
         } else {
             "failed"
         }
+    }
+
+    /// Attach structured failure taxonomy derived from `error` (if present).
+    pub fn with_classified_error(mut self, subagent_type: &str) -> Self {
+        if let Some(ref err) = self.error {
+            let class = if self.cancelled {
+                SubagentFailureClass::Cancelled
+            } else {
+                classify_subagent_failure(err)
+            };
+            let formatted = format_subagent_failure_message(subagent_type, err);
+            self.failure_class = Some(class);
+            self.failure_hint = Some(failure_hint_for(class, err));
+            self.error = Some(formatted);
+        }
+        self
     }
 }
 
@@ -1060,6 +1256,87 @@ mod tests {
             config.tools.is_empty(),
             "execute tools should still be filtered out"
         );
+    }
+
+    #[test]
+    fn satisfy_disables_background_when_companions_missing() {
+        let mut bash = tc("GrokBuild:run_terminal_cmd", ToolKind::Execute);
+        // Default / explicit background without companions — the quiz-session regression.
+        bash.params = Some(
+            serde_json::json!({ "enabled_background": true })
+                .as_object()
+                .unwrap()
+                .clone(),
+        );
+        let mut config = ToolServerConfig {
+            tools: vec![
+                bash,
+                tc("GrokBuild:read_file", ToolKind::Read),
+                tc("GrokBuild:search_replace", ToolKind::Edit),
+            ],
+            behavior_preset: None,
+        };
+
+        super::satisfy_background_bash_dependencies(&mut config);
+
+        let bash = config
+            .tools
+            .iter()
+            .find(|t| t.id == "GrokBuild:run_terminal_cmd")
+            .expect("bash remains");
+        let enabled = bash
+            .params
+            .as_ref()
+            .and_then(|p| p.get("enabled_background"))
+            .and_then(|v| v.as_bool());
+        assert_eq!(
+            enabled,
+            Some(false),
+            "background must be disabled when companions are missing"
+        );
+    }
+
+    #[test]
+    fn satisfy_leaves_background_when_companions_present() {
+        let mut config = ToolServerConfig {
+            tools: vec![
+                tc("GrokBuild:run_terminal_cmd", ToolKind::Execute),
+                tc("GrokBuild:get_task_output", ToolKind::BackgroundTaskAction),
+                tc("GrokBuild:kill_task", ToolKind::KillTaskAction),
+            ],
+            behavior_preset: None,
+        };
+
+        super::satisfy_background_bash_dependencies(&mut config);
+
+        let bash = config
+            .tools
+            .iter()
+            .find(|t| t.id == "GrokBuild:run_terminal_cmd")
+            .unwrap();
+        // Default enabled_background is true when param omitted.
+        let enabled = bash
+            .params
+            .as_ref()
+            .and_then(|p| p.get("enabled_background"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(true);
+        assert!(enabled, "background should stay enabled with companions");
+    }
+
+    #[test]
+    fn classify_spawn_tool_graph_from_requirements_error() {
+        let err = "Failed to spawn child session: agent building failed: tool error: \
+                   Requirements unsatisfied: enabled_background=true requires \
+                   GrokBuild:get_task_output and GrokBuild:kill_task";
+        assert_eq!(
+            super::classify_subagent_failure(err),
+            super::SubagentFailureClass::SpawnToolGraph
+        );
+        let msg = super::format_subagent_failure_message("worker", err);
+        assert!(msg.contains("failure_class=spawn_tool_graph"));
+        assert!(msg.contains("get_task_output"));
+        assert!(msg.contains("technical_detail:"));
     }
 
     #[test]
