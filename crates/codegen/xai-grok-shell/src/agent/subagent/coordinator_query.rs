@@ -140,6 +140,21 @@ impl SubagentCoordinator {
         }
         None
     }
+    /// Clone the active child [`SessionHandle`] for `session_id`, if any.
+    ///
+    /// Subagent sessions are tracked here (not in `MvpAgent.sessions`), so a
+    /// nested spawn whose parent is itself a subagent (e.g. manager → worker)
+    /// must resolve the parent handle through this map. Matches by subagent id
+    /// first, then by `child_session_id` (normally the same string).
+    pub(crate) fn active_session_handle(&self, session_id: &str) -> Option<SessionHandle> {
+        if let Some(t) = self.active.get(session_id) {
+            return Some(t.child_handle.clone());
+        }
+        self.active
+            .values()
+            .find(|t| t.child_session_id.0.as_ref() == session_id)
+            .map(|t| t.child_handle.clone())
+    }
     /// Mark a subagent as block-waited so auto-wake is suppressed on completion.
     pub(crate) fn mark_block_waited(&mut self, id: &str) {
         if let Some(t) = self.active.get_mut(id) {

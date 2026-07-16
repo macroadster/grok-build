@@ -133,3 +133,73 @@ async fn subagent_spawn_context_inherits_parent_ask_user_question_gate() {
         "subagent must inherit the parent's enabled ask_user_question gate"
     );
 }
+
+/// Manager (and other depth-1) subagents are tracked only in the subagent
+/// coordinator — not `MvpAgent.sessions`. Nested spawns (manager → worker)
+/// must resolve the parent handle from that map or they panic the ACP worker.
+#[tokio::test]
+async fn nested_subagent_parent_resolves_from_coordinator() {
+    use crate::agent::subagent::SubagentTracker;
+
+    let agent = build_minimal_agent_for_tests();
+    let manager_id = "manager-subagent-1";
+
+    // Not inserted into `agent.sessions` — mirrors a real manager subagent.
+    let mut manager_handle = make_test_handle("test-model", false, None);
+    manager_handle.info.id = acp::SessionId::new(manager_id);
+    manager_handle.info.cwd = "/tmp/manager-cwd".to_string();
+    manager_handle.agent_name = "manager".to_string();
+    manager_handle.tool_context.subagent_depth = 1;
+    let parent_gate = manager_handle.tool_context.goal_loop_active_gate.clone();
+
+    agent.subagent_coordinator.borrow_mut().insert(SubagentTracker {
+        subagent_id: manager_id.into(),
+        parent_session_id: "top-level-session".into(),
+        parent_prompt_id: None,
+        child_session_id: acp::SessionId::new(manager_id),
+        subagent_type: "manager".into(),
+        persona: None,
+        description: "coordinate work".into(),
+        started_at: std::time::Instant::now(),
+        child_handle: manager_handle,
+        child_thread: crate::session::SessionThread::from_handle(std::thread::spawn(|| {})),
+        cancel_token: tokio_util::sync::CancellationToken::new(),
+        resumed_from: None,
+        child_cwd: "/tmp/manager-cwd".into(),
+        worktree_path: None,
+        effective_model_id: "test-model".into(),
+        run_in_background: false,
+        surface_completion: true,
+        color: None,
+        block_waited: false,
+        explicitly_killed: false,
+    });
+
+    assert!(
+        agent
+            .sessions
+            .borrow()
+            .get(&acp::SessionId::new(manager_id))
+            .is_none(),
+        "manager subagent must not be in MvpAgent.sessions (precondition)"
+    );
+
+    let ctx = agent
+        .try_build_subagent_spawn_context(manager_id)
+        .expect("nested parent (manager subagent) must resolve via coordinator");
+
+    assert_eq!(ctx.parent_session_id, manager_id);
+    assert_eq!(ctx.parent_depth, 1, "worker should inherit manager depth 1");
+    assert_eq!(
+        ctx.parent_cwd,
+        std::path::PathBuf::from("/tmp/manager-cwd")
+    );
+    assert_eq!(ctx.parent_agent_name.as_deref(), Some("manager"));
+    // Shared gate proves we used the coordinator's SessionHandle, not a default.
+    use std::sync::atomic::Ordering::Relaxed;
+    parent_gate.store(true, Relaxed);
+    assert!(
+        ctx.goal_loop_active.load(Relaxed),
+        "spawn context must share the nested parent's goal-loop gate"
+    );
+}

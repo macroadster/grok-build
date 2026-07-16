@@ -64,12 +64,17 @@ impl MvpAgent {
                             tokio::task::spawn_local(async move {
                                 let this = agent_ref.get();
                                 let parent_sid = request.parent_session_id.clone();
+                                // Resolve top-level sessions and nested parents
+                                // (manager subagent → worker/watcher). Missing
+                                // parent is a teardown race or bug — fail the
+                                // spawn instead of panicking the ACP worker.
                                 let Some(mut ctx) =
                                     this.try_build_subagent_spawn_context(&parent_sid)
                                 else {
                                     tracing::warn!(
-                                        parent_session_id = % parent_sid, subagent_id = % request
-                                        .id,
+                                        parent_session_id = %parent_sid,
+                                        subagent_id = %request.id,
+                                        subagent_type = %request.subagent_type,
                                         "Spawn for unknown/evicted parent session, failing request"
                                     );
                                     this.subagent_coordinator
@@ -81,11 +86,9 @@ impl MvpAgent {
                                     );
                                     return;
                                 };
-                                let parent_handle = {
-                                    let parent_sid_acp = acp::SessionId::new(parent_sid.clone());
-                                    this.sessions.borrow().get(&parent_sid_acp).cloned()
-                                };
-                                if let Some(handle) = parent_handle {
+                                if let Some(handle) =
+                                    this.resolve_parent_session_handle(&parent_sid)
+                                {
                                     ctx.parent_mcp_pool = handle.snapshot_mcp_pool().await;
                                     ctx.client_hooks = handle.snapshot_client_hooks().await;
                                     let parent_tools = handle.snapshot_tool_definitions().await;
@@ -343,23 +346,37 @@ impl MvpAgent {
             });
         }
     }
+    /// Resolve a parent [`SessionHandle`] for subagent spawn / validation.
+    ///
+    /// Top-level sessions live in `self.sessions`. Nested parents (a manager
+    /// subagent spawning a worker) live only in the subagent coordinator's
+    /// active map — they are never inserted into `MvpAgent.sessions`.
+    pub(super) fn resolve_parent_session_handle(
+        &self,
+        parent_session_id: &str,
+    ) -> Option<crate::session::SessionHandle> {
+        let parent_sid = acp::SessionId::new(parent_session_id);
+        if let Some(handle) = self.sessions.borrow().get(&parent_sid).cloned() {
+            return Some(handle);
+        }
+        self.subagent_coordinator
+            .borrow()
+            .active_session_handle(parent_session_id)
+    }
     /// Lightweight context for the `SubagentEvent::ValidateType` drain arm;
     /// tolerates evicted parent sessions (returns built-in defaults + warns).
     pub(super) fn build_subagent_validation_context(
         &self,
         parent_session_id: &str,
     ) -> crate::agent::subagent::SubagentValidationContext {
-        let parent_sid = acp::SessionId::new(parent_session_id);
-        let (parent_cwd, allowed_subagent_types) = {
-            let sessions = self.sessions.borrow();
-            let ps = sessions.get(&parent_sid);
-            warn_on_missing_parent_session_for_validate_type(parent_session_id, ps.is_some());
-            (
-                ps.map(|h| std::path::PathBuf::from(&h.info.cwd))
-                    .unwrap_or_default(),
-                ps.and_then(|h| h.allowed_subagent_types.clone()),
-            )
-        };
+        let ps = self.resolve_parent_session_handle(parent_session_id);
+        warn_on_missing_parent_session_for_validate_type(parent_session_id, ps.is_some());
+        let (parent_cwd, allowed_subagent_types) = (
+            ps.as_ref()
+                .map(|h| std::path::PathBuf::from(&h.info.cwd))
+                .unwrap_or_default(),
+            ps.and_then(|h| h.allowed_subagent_types.clone()),
+        );
         let (cli_agent_names, subagent_toggle) = {
             let cfg = self.cfg.borrow();
             (
@@ -379,7 +396,8 @@ impl MvpAgent {
     /// [`Self::try_build_subagent_spawn_context`]. Production spawn paths use
     /// the fallible variant and fail the request when the parent session is
     /// absent (evicted, or a child-session spawn whose re-parent lookup
-    /// missed).
+    /// missed). Nested parents (manager subagent) are resolved via the
+    /// subagent coordinator, not only `MvpAgent.sessions`.
     #[cfg(test)]
     pub(super) fn build_subagent_spawn_context(
         &self,
@@ -390,91 +408,39 @@ impl MvpAgent {
     }
     /// Build a `SubagentSpawnContext` from the current agent state and the
     /// parent session's shared resources. Returns `None` when the parent
-    /// `SessionHandle` is absent (evicted / torn down) so callers can fail
-    /// the request instead of panicking.
+    /// `SessionHandle` is absent (evicted / torn down, or never a
+    /// top-level/active subagent session) so callers can fail the request
+    /// instead of panicking.
     ///
     /// This is the ONLY subagent-related method on MvpAgent besides the
-    /// coordinator startup.
+    /// coordinator startup. Nested parents (manager → worker) resolve via
+    /// [`Self::resolve_parent_session_handle`].
     pub(super) fn try_build_subagent_spawn_context(
         &self,
         parent_session_id: &str,
     ) -> Option<crate::agent::subagent::SubagentSpawnContext> {
         let parent_sid = acp::SessionId::new(parent_session_id);
-        let (
-            parent_model_id,
-            parent_chat_state,
-            parent_cmd_tx,
-            parent_cwd,
-            yolo_mode,
-            parent_depth,
-            hunk_tracker_handle,
-            hunk_tracking_enabled,
-            fs,
-            terminal,
-            session_env,
-            parent_attribution_callback,
-            parent_agent_name,
-            parent_managed_mcp_proxy_base_url,
-        ) = {
-            let sessions = self.sessions.borrow();
-            let ps = sessions.get(&parent_sid);
-            (
-                ps.map(|h| h.model_id.clone())
-                    .unwrap_or_else(|| self.models_manager.current_model_id()),
-                ps.map(|h| h.chat_state_handle.clone()),
-                ps.map(|h| h.cmd_tx.clone()),
-                ps.map(|h| std::path::PathBuf::from(&h.info.cwd))
-                    .unwrap_or_default(),
-                ps.map(|h| h.yolo_mode).unwrap_or(self.default_yolo_mode),
-                ps.map(|h| h.tool_context.subagent_depth).unwrap_or(0),
-                ps.map(|h| h.tool_context.hunk_tracker_handle.clone())
-                    .unwrap_or_else(xai_hunk_tracker::HunkTrackerHandle::noop),
-                ps.map(|h| h.tool_context.hunk_tracking_enabled)
-                    .unwrap_or(false),
-                ps.map(|h| h.tool_context.fs.inner().clone())
-                    .unwrap_or_else(|| {
-                        let cwd = ps
-                            .map(|h| std::path::PathBuf::from(&h.info.cwd))
-                            .unwrap_or_default();
-                        std::sync::Arc::new(xai_grok_workspace::file_system::LocalFs::new(cwd))
-                    }),
-                ps.map(|h| h.tool_context.terminal.clone())
-                    .unwrap_or_else(|| {
-                        std::sync::Arc::new(crate::terminal::TerminalRunner::new(
-                            std::sync::Arc::new(self.gateway.clone()),
-                            parent_sid.clone(),
-                        ))
-                    }),
-                ps.map(|h| h.tool_context.session_env.clone())
-                    .unwrap_or_else(|| std::sync::Arc::new(std::collections::HashMap::new())),
-                ps.and_then(|h| h.attribution_callback.clone()),
-                ps.map(|h| h.agent_name.clone()),
-                ps.map(|h| h.managed_mcp_proxy_base_url.clone()),
-            )
-        };
-        let (
-            parent_workspace_ops,
-            parent_terminal_backend,
-            parent_notification_handle,
-            parent_scheduler_handle,
-        ) = {
-            let sessions = self.sessions.borrow();
-            sessions.get(&parent_sid).map(|ps| {
-                (
-                    ps.workspace_ops.clone(),
-                    ps.terminal_backend.clone(),
-                    ps.tools_notification_handle.clone(),
-                    ps.scheduler_handle.clone(),
-                )
-            })
-        }?;
+        let ps = self.resolve_parent_session_handle(parent_session_id)?;
+        let parent_model_id = ps.model_id.clone();
+        let parent_chat_state = Some(ps.chat_state_handle.clone());
+        let parent_cmd_tx = Some(ps.cmd_tx.clone());
+        let parent_cwd = std::path::PathBuf::from(&ps.info.cwd);
+        let yolo_mode = ps.yolo_mode;
+        let parent_depth = ps.tool_context.subagent_depth;
+        let hunk_tracker_handle = ps.tool_context.hunk_tracker_handle.clone();
+        let hunk_tracking_enabled = ps.tool_context.hunk_tracking_enabled;
+        let fs = ps.tool_context.fs.inner().clone();
+        let terminal = ps.tool_context.terminal.clone();
+        let session_env = ps.tool_context.session_env.clone();
+        let parent_attribution_callback = ps.attribution_callback.clone();
+        let parent_agent_name = ps.agent_name.clone();
+        let parent_managed_mcp_proxy_base_url = ps.managed_mcp_proxy_base_url.clone();
+        let parent_workspace_ops = ps.workspace_ops.clone();
+        let parent_terminal_backend = ps.terminal_backend.clone();
+        let parent_notification_handle = ps.tools_notification_handle.clone();
+        let parent_scheduler_handle = ps.scheduler_handle.clone();
         let available_models = self.models_manager.models();
-        let parent_lsp = {
-            let sessions = self.sessions.borrow();
-            sessions
-                .get(&parent_sid)
-                .and_then(|h| h.tool_context.lsp.clone())
-        };
+        let parent_lsp = ps.tool_context.lsp.clone();
         let am = self.auth_manager.clone();
         let inference_idle_timeout_secs = {
             let per_model = config::find_model_by_id(&available_models, parent_model_id.0.as_ref())
@@ -486,26 +452,12 @@ impl MvpAgent {
                 .and_then(|s| s.inference_idle_timeout_secs);
             per_model.or(remote).unwrap_or(600).max(10)
         };
-        let parent_hook_registry = {
-            let sessions = self.sessions.borrow();
-            sessions
-                .get(&parent_sid)
-                .and_then(|h| h.hook_registry.clone())
-        };
-        let parent_max_turns = {
-            let sessions = self.sessions.borrow();
-            sessions.get(&parent_sid).and_then(|h| h.max_turns)
-        };
+        let parent_hook_registry = ps.hook_registry.clone();
+        let parent_max_turns = ps.max_turns;
         let parent_model_agent_type =
             config::find_model_by_id(&available_models, parent_model_id.0.as_ref())
                 .map(|e| e.info.agent_type.clone());
-        let ask_user_question_enabled = {
-            let sessions = self.sessions.borrow();
-            sessions
-                .get(&parent_sid)
-                .map(|h| h.ask_user_question_enabled)
-                .unwrap_or_else(|| self.cfg.borrow().resolve_ask_user_question().value)
-        };
+        let ask_user_question_enabled = ps.ask_user_question_enabled;
         let (gcs_upload_method, gcs_bucket_url) = match self.trace_upload_config_snapshot() {
             Some(method) => {
                 use crate::session::repo_changes::UploadMethod;
@@ -548,8 +500,7 @@ impl MvpAgent {
             gateway: self.gateway.clone(),
             client_hooks: Default::default(),
             sampling_config: self.sampling_config.borrow().clone(),
-            managed_mcp_proxy_base_url: parent_managed_mcp_proxy_base_url
-                .unwrap_or_else(|| self.cli_chat_proxy_base_url()),
+            managed_mcp_proxy_base_url: parent_managed_mcp_proxy_base_url,
             alpha_test_key: self.alpha_test_key(),
             auth_method_id: self
                 .auth_method_id
@@ -584,15 +535,10 @@ impl MvpAgent {
             background_workflows_enabled: self.cfg.borrow().resolve_workflows().value,
             ask_user_question_enabled,
             parent_cmd_tx: parent_cmd_tx.clone(),
-            parent_session_info: {
-                let sessions = self.sessions.borrow();
-                sessions
-                    .get(&parent_sid)
-                    .map(|h| crate::session::info::Info {
-                        id: parent_sid.clone(),
-                        cwd: h.info.cwd.clone(),
-                    })
-            },
+            parent_session_info: Some(crate::session::info::Info {
+                id: parent_sid.clone(),
+                cwd: ps.info.cwd.clone(),
+            }),
             parent_chat_state,
             parent_max_turns,
             available_models,
@@ -625,12 +571,7 @@ impl MvpAgent {
             gcs_upload_method,
             hook_registry: parent_hook_registry,
             hook_workspace_root: String::new(),
-            permission_handle: {
-                let sessions = self.sessions.borrow();
-                sessions
-                    .get(&parent_sid)
-                    .map(|h| h.permission_handle.clone())
-            },
+            permission_handle: Some(ps.permission_handle.clone()),
             worktree_type: self.worktree_type,
             api_key_provider: Some(Arc::new(crate::auth::manager::SharedAuthKeyProvider(
                 am.clone(),
@@ -639,68 +580,22 @@ impl MvpAgent {
             workspace_ops: parent_workspace_ops.clone(),
             auth_manager: am.clone(),
             attribution_callback: parent_attribution_callback,
-            parent_agent_name,
+            parent_agent_name: Some(parent_agent_name),
             parent_model_agent_type,
-            allowed_subagent_types: {
-                let sessions = self.sessions.borrow();
-                sessions
-                    .get(&parent_sid)
-                    .and_then(|h| h.allowed_subagent_types.clone())
-            },
-            parent_mcp_configs: {
-                let sessions = self.sessions.borrow();
-                sessions
-                    .get(&parent_sid)
-                    .map(|h| h.mcp_servers.clone())
-                    .unwrap_or_default()
-            },
+            allowed_subagent_types: ps.allowed_subagent_types.clone(),
+            parent_mcp_configs: ps.mcp_servers.clone(),
             managed_mcp_state: self.managed_mcp_cache.clone(),
             parent_mcp_pool: None,
             parent_tool_snapshot: None,
             parent_skills: None,
             parent_skills_config: self.cfg.borrow().skills.clone(),
             parent_compat: self.cfg.borrow().compat_resolved,
-            task_completion_reservations: {
-                let sessions = self.sessions.borrow();
-                sessions
-                    .get(&parent_sid)
-                    .and_then(|h| h.tool_context.task_completion_reservations.clone())
-            },
-            synthetic_trace_tx: {
-                let sessions = self.sessions.borrow();
-                sessions
-                    .get(&parent_sid)
-                    .and_then(|h| h.tool_context.synthetic_trace_tx.clone())
-            },
-            task_output_tool_name: {
-                let sessions = self.sessions.borrow();
-                sessions
-                    .get(&parent_sid)
-                    .map(|h| h.tool_context.task_output_tool_name.clone())
-                    .unwrap_or_else(|| {
-                        xai_grok_tools::reminders::task_completion::DEFAULT_TASK_OUTPUT_TOOL
-                            .to_string()
-                    })
-            },
+            task_completion_reservations: ps.tool_context.task_completion_reservations.clone(),
+            synthetic_trace_tx: ps.tool_context.synthetic_trace_tx.clone(),
+            task_output_tool_name: ps.tool_context.task_output_tool_name.clone(),
             auto_wake_enabled: self.cfg.borrow().auto_wake_enabled,
-            goal_loop_active: {
-                let sessions = self.sessions.borrow();
-                sessions
-                    .get(&parent_sid)
-                    .map(|h| h.tool_context.goal_loop_active_gate.clone())
-                    .unwrap_or_else(|| {
-                        std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false))
-                    })
-            },
-            parent_blocking_wait_depth: {
-                let sessions = self.sessions.borrow();
-                sessions
-                    .get(&parent_sid)
-                    .map(|h| h.tool_context.blocking_wait_depth.clone())
-                    .unwrap_or_else(|| {
-                        std::sync::Arc::new(crate::tools::tool_context::BlockingWaitState::new())
-                    })
-            },
+            goal_loop_active: ps.tool_context.goal_loop_active_gate.clone(),
+            parent_blocking_wait_depth: ps.tool_context.blocking_wait_depth.clone(),
             parent_terminal_backend: parent_terminal_backend.clone(),
             parent_notification_handle: parent_notification_handle.clone(),
             parent_scheduler_handle: parent_scheduler_handle.clone(),
