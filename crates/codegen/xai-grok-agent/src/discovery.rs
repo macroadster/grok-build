@@ -66,7 +66,7 @@ pub enum SubagentSource {
 /// Build the complete list of enabled subagents.
 ///
 /// 1. Start with built-in subagent definitions (general-purpose, explore, plan,
-///    manager, worker, watcher)
+///    entrepreneur, manager, worker, watcher)
 /// 2. Discover user-defined agents from project, user, and bundled agent dirs
 /// 3. Merge: project-level user agents shadow built-ins with the same name;
 ///    user-level and bundled agents with built-in names are skipped (maintains
@@ -314,6 +314,10 @@ fn by_name_in_cwd_with_home(
 /// - `general-purpose` — all tools, autonomous research & multi-step tasks
 /// - `explore` — fast read-only codebase exploration (fast model hint)
 /// - `plan` — read-only architecture & implementation planning
+/// - `entrepreneur` — high-level visionary, delegates to managers
+/// - `manager` — orchestrator, delegates to workers and watchers
+/// - `worker` — primary task executor with full tools
+/// - `watcher` — independent verifier, read-only + execute
 pub fn builtin_subagents() -> Vec<AgentDefinition> {
     BuiltinAgentName::subagent_variants()
         .iter()
