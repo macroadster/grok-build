@@ -28,14 +28,17 @@ use xai_tool_types::{SubagentCompletedOutput, SubagentIsolationMode, TaskToolInp
 
 /// Maximum nesting depth for subagents.
 ///
-/// - Depth 0: top-level session (main agent or top-level manager).
-/// - Depth 1: first-level subagent (e.g. a manager spawned by the main agent).
-///   May still spawn children so manager → worker/watcher works.
-/// - Depth 2: second-level subagent (worker/watcher). Task is stripped and
-///   further spawns are rejected.
+/// - Depth 0: top-level session (main agent or top-level entrepreneur).
+/// - Depth 1: first-level subagent (e.g. an entrepreneur or manager spawned
+///   by the main agent). May still spawn children.
+/// - Depth 2: second-level subagent (e.g. a manager spawned by an
+///   entrepreneur, or a worker/watcher spawned by a manager). May still
+///   spawn children so entrepreneur → manager → worker/watcher works.
+/// - Depth 3: third-level subagent (worker/watcher at the bottom of an
+///   entrepreneur chain). Task is stripped and further spawns are rejected.
 ///
 /// Spawns are rejected when the caller's depth is `>= MAX_SUBAGENT_DEPTH`.
-pub const MAX_SUBAGENT_DEPTH: u32 = 2;
+pub const MAX_SUBAGENT_DEPTH: u32 = 3;
 
 // ───────────────────────────────────────────────────────────────────────────
 // Tool implementation

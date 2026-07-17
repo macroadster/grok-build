@@ -461,6 +461,37 @@ fn orchestrator_toolset() -> ToolServerConfig {
         behavior_preset: None,
     }
 }
+/// Entrepreneur toolset: read/search/orchestration tools for strategic oversight.
+///
+/// The entrepreneur delegates all execution planning to manager subagents.
+/// It retains read_file, grep, list_dir for landscape understanding, plus
+/// the full subagent stack for spawning managers. Bash is included for
+/// quick orientation (`ls`, `git status`); the prompt forbids using it
+/// for any implementation work. No file editing tools.
+fn entrepreneur_toolset() -> ToolServerConfig {
+    ToolServerConfig {
+        tools: vec![
+            bash_tool_config(),
+            (&grok_build::ReadFileTool).into(),
+            (&grok_build::ListDirTool).into(),
+            (&grok_build::GrepTool).into(),
+            task_tool_config(),
+            task_output_tool_config(),
+            wait_tasks_tool_config(),
+            kill_task_tool_config(),
+            (&search_tool::SearchTool).into(),
+            (&use_tool::UseTool).into(),
+            (&grok_build::TodoWriteTool).into(),
+            (&grok_build::AskUserQuestionTool).into(),
+            (&grok_build::UpdateGoalTool).into(),
+            (&grok_build::EnterPlanModeTool).into(),
+            (&grok_build::ExitPlanModeTool).into(),
+            (&grok_build::WebSearchTool).into(),
+        ],
+        behavior_preset: None,
+    }
+}
+
 /// Manager toolset: read/search/orchestration tools, no file editing.
 ///
 /// The manager delegates all implementation to worker subagents and
@@ -498,7 +529,7 @@ fn manager_toolset() -> ToolServerConfig {
 ///
 /// Intentionally omits Task/spawn tools — workers execute, they do not
 /// orchestrate. Nesting is also blocked by `MAX_SUBAGENT_DEPTH` once the
-/// worker is a depth-2 child of a manager.
+/// worker is at the bottom of the delegation chain.
 ///
 /// Background bash requires companion observe/cancel tools on the **same**
 /// agent (`get_task_output` + `kill_task`). Include them whenever bash is
@@ -739,8 +770,8 @@ where
 /// agents for centralized name management and `by_name()` dispatch.
 ///
 /// `subagent_variants()` returns only the types exposed to the LLM via the
-/// `TaskTool` description (currently 6: general-purpose, explore, plan,
-/// manager, worker, watcher). The remaining built-ins are top-level agent
+/// `TaskTool` description (currently 7: general-purpose, explore, plan,
+/// entrepreneur, manager, worker, watcher). The remaining built-ins are top-level agent
 /// profiles resolvable by name but not advertised as subagent types.
 #[derive(
     Debug, Clone, Copy, PartialEq, Eq, Hash, Display, EnumString, EnumIter, AsRefStr, IntoStaticStr,
@@ -760,6 +791,7 @@ pub enum BuiltinAgentName {
     BrowserUse,
     #[strum(serialize = "grok-build-orchestrator")]
     GrokBuildOrchestrator,
+    Entrepreneur,
     Manager,
     Worker,
     Watcher,
@@ -791,6 +823,7 @@ impl BuiltinAgentName {
             Self::Plan => AgentDefinition::plan(),
             Self::BrowserUse => AgentDefinition::browser_use(),
             Self::GrokBuildOrchestrator => AgentDefinition::grok_build_orchestrator(),
+            Self::Entrepreneur => AgentDefinition::entrepreneur(),
             Self::Manager => AgentDefinition::manager(),
             Self::Worker => AgentDefinition::worker(),
             Self::Watcher => AgentDefinition::watcher(),
@@ -802,6 +835,7 @@ impl BuiltinAgentName {
             Self::GeneralPurpose,
             Self::Explore,
             Self::Plan,
+            Self::Entrepreneur,
             Self::Manager,
             Self::Worker,
             Self::Watcher,
@@ -1696,6 +1730,23 @@ impl AgentDefinition {
             )
         }
     }
+    /// Entrepreneur subagent — high-level visionary that sets strategic direction
+    /// and delegates execution to manager subagents.
+    ///
+    /// The entrepreneur sits at the top of the delegation hierarchy:
+    /// entrepreneur → manager → worker/watcher.
+    pub fn entrepreneur() -> Self {
+        use crate::prompt::subagent_prompts;
+        Self {
+            description: xai_tool_types::ENTREPRENEUR_SUBAGENT
+                .description
+                .to_string(),
+            tool_config: entrepreneur_toolset(),
+            inject_default_tools: false,
+            prompt_body: Some(subagent_prompts::ENTREPRENEUR_PROMPT.to_string()),
+            ..Self::base(BuiltinAgentName::Entrepreneur, "")
+        }
+    }
     /// Manager subagent — coordinates work by delegating to workers and watchers.
     ///
     /// Prefer starting a session as `manager` for user-facing orchestration, or
@@ -1922,6 +1973,7 @@ mod tests {
         match name {
             BuiltinAgentName::Codex
             | BuiltinAgentName::GrokBuildOrchestrator
+            | BuiltinAgentName::Entrepreneur
             | BuiltinAgentName::Manager
             | BuiltinAgentName::Worker
             | BuiltinAgentName::Watcher => true,
@@ -1958,6 +2010,7 @@ mod tests {
         for strict in [
             "codex",
             "grok-build-orchestrator",
+            "entrepreneur",
             "manager",
             "worker",
             "watcher",
@@ -2584,6 +2637,7 @@ description: Test default tool config
             ("general-purpose", BuiltinAgentName::GeneralPurpose),
             ("explore", BuiltinAgentName::Explore),
             ("plan", BuiltinAgentName::Plan),
+            ("entrepreneur", BuiltinAgentName::Entrepreneur),
             ("browser-use", BuiltinAgentName::BrowserUse),
         ] {
             let parsed = BuiltinAgentName::from_str(s).unwrap();
@@ -2613,20 +2667,23 @@ description: Test default tool config
     #[test]
     fn test_builtin_agent_name_subagent_variants() {
         let variants = BuiltinAgentName::subagent_variants();
-        assert_eq!(variants.len(), 6);
+        assert_eq!(variants.len(), 7);
         assert!(variants.contains(&BuiltinAgentName::GeneralPurpose));
         assert!(variants.contains(&BuiltinAgentName::Explore));
         assert!(variants.contains(&BuiltinAgentName::Plan));
+        assert!(variants.contains(&BuiltinAgentName::Entrepreneur));
         assert!(variants.contains(&BuiltinAgentName::Manager));
         assert!(variants.contains(&BuiltinAgentName::Worker));
         assert!(variants.contains(&BuiltinAgentName::Watcher));
     }
     #[test]
-    fn manager_worker_watcher_toolsets_are_role_differentiated() {
+    fn entrepreneur_manager_worker_watcher_toolsets_are_role_differentiated() {
+        let entrepreneur = AgentDefinition::entrepreneur();
         let manager = AgentDefinition::manager();
         let worker = AgentDefinition::worker();
         let watcher = AgentDefinition::watcher();
 
+        assert!(!entrepreneur.inject_default_tools);
         assert!(!manager.inject_default_tools);
         assert!(!worker.inject_default_tools);
         assert!(!watcher.inject_default_tools);
@@ -2638,6 +2695,10 @@ description: Test default tool config
         let kill_task_id = kill_task_tool_config().id;
 
         let has = |def: &AgentDefinition, id: &str| def.tool_config.tools.iter().any(|t| t.id == id);
+
+        // Entrepreneur: strategic visionary (has Task to spawn managers), cannot edit files.
+        assert!(has(&entrepreneur, &task_id), "entrepreneur must have Task");
+        assert!(!has(&entrepreneur, &edit_id), "entrepreneur must not have SearchReplace");
 
         // Manager: orchestrates (has Task), cannot edit files.
         assert!(has(&manager, &task_id), "manager must have Task");

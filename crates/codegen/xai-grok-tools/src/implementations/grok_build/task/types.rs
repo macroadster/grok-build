@@ -1006,8 +1006,9 @@ pub struct SubagentListActiveRequest {
 /// Tracks nesting depth. Injected into child's Resources with depth+1.
 ///
 /// Top-level sessions start at depth 0. Each child increments by 1.
-/// `TaskTool` rejects spawns when `depth >= MAX_SUBAGENT_DEPTH` (currently 2,
-/// so a manager at depth 1 can still spawn worker/watcher children).
+/// `TaskTool` rejects spawns when `depth >= MAX_SUBAGENT_DEPTH` (currently 3,
+/// so an entrepreneur at depth 1 can spawn a manager at depth 2, which can
+/// then spawn worker/watcher children at depth 3).
 #[derive(Debug, Clone)]
 pub struct SubagentDepthCounter(pub u32);
 

@@ -1285,6 +1285,7 @@ fn builtin_tools_fragment(name: BuiltinAgentName) -> String {
         BuiltinAgentName::GeneralPurpose => xai_tool_types::GENERAL_PURPOSE_SUBAGENT,
         BuiltinAgentName::Explore => xai_tool_types::EXPLORE_SUBAGENT,
         BuiltinAgentName::Plan => xai_tool_types::PLAN_SUBAGENT,
+        BuiltinAgentName::Entrepreneur => xai_tool_types::ENTREPRENEUR_SUBAGENT,
         BuiltinAgentName::Manager => xai_tool_types::MANAGER_SUBAGENT,
         BuiltinAgentName::Worker => xai_tool_types::WORKER_SUBAGENT,
         BuiltinAgentName::Watcher => xai_tool_types::WATCHER_SUBAGENT,
