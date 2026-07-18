@@ -92,8 +92,7 @@ use crate::upload::turn::{
     PromptTraceContext, UploadWait, complete_prompt_trace, spawn_upload_task,
 };
 use crate::upload::turn::{
-    apply_yolo_mode_to_matching_sessions, lookup_session_model,
-    parse_agent_profile_from_meta,
+    apply_yolo_mode_to_matching_sessions, lookup_session_model, parse_agent_profile_from_meta,
 };
 use tokio_util::sync::CancellationToken;
 use xai_grok_paths::AbsPathBuf;

@@ -56,8 +56,8 @@ use permissions::{apply_recap_block, handle_permission_request, should_drop_late
 
 // Hub + child modules (via `use super::*`) need sibling symbols in this scope.
 use routing::{
-    SessionMatch, find_session_match, interaction_target_agent, is_matched_agent_active,
-    mcp_target_agent, resolve_notif_agent, resolve_target_view,
+    SessionMatch, find_session_match, find_subagent_view_mut, interaction_target_agent,
+    is_matched_agent_active, mcp_target_agent, resolve_notif_agent, resolve_target_view,
 };
 
 use prompt_origin::{finish_wake_turn, viewer_turn_anchor};
@@ -528,13 +528,13 @@ pub(crate) fn handle(msg: AcpClientMessage, app: &mut AppView) -> bool {
                         .expect("find_session_match returned an existing AgentId");
                     // Re-derive the &str key to avoid making SessionMatch::Child
                     // carry an owned String (see find_session_match docs).
+                    // Recursive: worker/watcher may be nested under a manager.
                     let child_key: &str = notif.request.session_id.0.as_ref();
 
                     let activity_label = {
-                        let child_view = parent
-                            .subagent_views
-                            .get_mut(child_key)
-                            .expect("find_session_match returned an existing subagent_views key");
+                        let child_view = find_subagent_view_mut(parent, child_key).expect(
+                            "find_session_match returned an existing subagent_views key",
+                        );
                         if let Some(tokens) = meta.total_tokens {
                             confirm_context_used(child_view, tokens);
                         }

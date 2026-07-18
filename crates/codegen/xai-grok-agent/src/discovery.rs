@@ -339,6 +339,39 @@ pub fn all_builtin_agent_definitions() -> Vec<AgentDefinition> {
         .collect()
 }
 
+/// Human-readable error when an explicit agent type name cannot be resolved.
+///
+/// Used by CLI `--agent`, `GROK_AGENT`, and `_meta.agentProfile` so typos do
+/// not silently fall through to the default agent.
+pub fn unknown_agent_type_message(name: &str) -> String {
+    let mut available: Vec<String> = all_builtin_agent_definitions()
+        .into_iter()
+        .map(|d| d.name)
+        .collect();
+    available.sort();
+    available.dedup();
+    format!(
+        "unknown agent type '{name}'. Available built-in agents: {}. \
+         Project agents under .grok/agents/ and user agents under ~/.grok/agents/ \
+         are also accepted.",
+        available.join(", ")
+    )
+}
+
+/// Resolve `name` via discovery, or return a descriptive error.
+///
+/// Prefer this over [`by_name_in_cwd`] when the name came from an explicit user
+/// input (`--agent`, `GROK_AGENT`, config `[agent] name`) so invalid types
+/// surface as errors instead of silent fallback.
+pub fn require_by_name_in_cwd(name: &str, cwd: &Path) -> Result<AgentDefinition, String> {
+    by_name_in_cwd(name, cwd).ok_or_else(|| unknown_agent_type_message(name))
+}
+
+/// Resolve `name` via discovery (no project cwd), or return a descriptive error.
+pub fn require_by_name(name: &str) -> Result<AgentDefinition, String> {
+    by_name(name).ok_or_else(|| unknown_agent_type_message(name))
+}
+
 /// Parse only YAML frontmatter from an agent file, without loading the body.
 pub fn parse_agent_frontmatter_only(path: &Path) -> Result<AgentDefinition, AgentBuildError> {
     AgentDefinition::from_file_frontmatter_only(path)
@@ -802,6 +835,34 @@ mod tests {
         // project/user-level agent file exists with that name.
         let def = by_name("not-a-builtin-agent");
         assert!(def.is_none());
+    }
+
+    #[test]
+    fn require_by_name_rejects_unknown_with_available_list() {
+        let err = require_by_name("not-a-real-agent-xyz")
+            .expect_err("unknown agent must error");
+        assert!(
+            err.contains("unknown agent type 'not-a-real-agent-xyz'"),
+            "error should name the bad type: {err}"
+        );
+        assert!(
+            err.contains("entrepreneur") && err.contains("manager"),
+            "error should list built-ins including entrepreneur/manager: {err}"
+        );
+    }
+
+    #[test]
+    fn require_by_name_accepts_builtin_entrepreneur() {
+        let def = require_by_name("entrepreneur").expect("entrepreneur is a built-in");
+        assert_eq!(def.name, "entrepreneur");
+    }
+
+    #[test]
+    fn require_by_name_in_cwd_rejects_unknown() {
+        let tmp = tempfile::tempdir().unwrap();
+        let err = require_by_name_in_cwd("not-a-real-agent-xyz", tmp.path())
+            .expect_err("unknown agent must error");
+        assert!(err.contains("unknown agent type"));
     }
 
     #[test]

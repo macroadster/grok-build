@@ -242,6 +242,101 @@
         );
     }
 
+    /// Entrepreneur → manager → worker: when a manager (itself a subagent)
+    /// spawns a worker, `SubagentSpawned` is scoped to the manager session.
+    /// The grandchild must register under the manager's `subagent_views` so
+    /// the user can navigate into worker/watcher level from the manager view.
+    #[test]
+    fn nested_subagent_spawned_under_manager_is_navigable() {
+        let mut app = make_app_with_agent("sess-entrepreneur");
+        let manager_sid = "sess-manager";
+        let worker_sid = "sess-worker";
+
+        // Root entrepreneur spawns manager.
+        let affected = handle(
+            make_ext_session_notification(
+                "sess-entrepreneur",
+                test_subagent_spawned("sess-entrepreneur", manager_sid),
+            ),
+            &mut app,
+        );
+        assert!(affected, "manager spawn under entrepreneur must redraw");
+        {
+            let agent = app.agents.get(&AgentId(0)).unwrap();
+            assert!(
+                agent.subagent_views.contains_key(manager_sid),
+                "manager must be registered on the entrepreneur root"
+            );
+            assert!(
+                !agent.subagent_views.contains_key(worker_sid),
+                "worker must not exist yet"
+            );
+        }
+
+        // Manager spawns worker — notification session_id is the manager.
+        let affected = handle(
+            make_ext_session_notification(
+                manager_sid,
+                test_subagent_spawned(manager_sid, worker_sid),
+            ),
+            &mut app,
+        );
+        assert!(
+            affected,
+            "worker spawn under manager must redraw when entrepreneur is active"
+        );
+
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        assert!(
+            !agent.subagent_sessions.contains_key(worker_sid),
+            "worker must not be flat-registered on the entrepreneur root"
+        );
+        let manager = agent
+            .subagent_views
+            .get(manager_sid)
+            .expect("manager view must exist");
+        assert!(
+            manager.subagent_sessions.contains_key(worker_sid),
+            "worker must be registered on the manager's subagent_sessions for the tasks pane"
+        );
+        assert!(
+            manager.subagent_views.contains_key(worker_sid),
+            "worker must have a navigable subagent_view under the manager"
+        );
+        let worker_info = manager.subagent_sessions.get(worker_sid).unwrap();
+        assert_eq!(worker_info.description.as_ref(), "scan src/");
+        assert!(
+            manager.scrollback.len() >= 1,
+            "manager scrollback must show a SubagentBlock for the worker"
+        );
+
+        // Progress + finish also scoped to the manager session.
+        let _ = handle(
+            make_ext_session_notification(
+                manager_sid,
+                test_subagent_progress(manager_sid, worker_sid),
+            ),
+            &mut app,
+        );
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let manager = agent.subagent_views.get(manager_sid).unwrap();
+        assert_eq!(
+            manager.subagent_sessions.get(worker_sid).unwrap().duration_ms,
+            Some(100)
+        );
+
+        let affected = handle(
+            make_ext_session_notification(manager_sid, test_subagent_finished(worker_sid)),
+            &mut app,
+        );
+        assert!(affected);
+        let agent = app.agents.get(&AgentId(0)).unwrap();
+        let manager = agent.subagent_views.get(manager_sid).unwrap();
+        let worker_info = manager.subagent_sessions.get(worker_sid).unwrap();
+        assert!(worker_info.finished);
+        assert_eq!(worker_info.status.as_deref(), Some("completed"));
+    }
+
     /// The live activity label fans out to `SubagentInfo` (tasks pane /
     /// dashboard rows) alongside the scrollback block — from both the child
     /// session/update path and the `SubagentProgress` path — and
