@@ -2816,16 +2816,18 @@ impl MvpAgent {
         if let Some(ref name) = agent_config.name {
             tracing::info!(
                 agent_name = % name,
-                "Resolving agent definition from config.toml [agent] name"
+                "Resolving agent definition from config.toml [agent] name / --agent"
             );
-            if let Some(def) = xai_grok_agent::discovery::by_name_in_cwd(name, cwd) {
-                return def;
+            match xai_grok_agent::discovery::require_by_name_in_cwd(name, cwd) {
+                Ok(def) => return def,
+                Err(msg) => {
+                    // Explicit agent selection must not silently fall back to
+                    // the default — that hid typos like `--agent=entreprenuer`.
+                    tracing::error!(agent_name = %name, "{msg}");
+                    eprintln!("error: {msg}");
+                    crate::instrumentation::finalize_and_exit(1);
+                }
             }
-            tracing::warn!(
-                agent_name = % name,
-                "Agent '{}' not found via discovery, falling through to next source",
-                name
-            );
         }
         let agent_name = std::env::var("GROK_AGENT").ok();
         let resolved = match agent_name.as_deref() {
@@ -2837,18 +2839,25 @@ impl MvpAgent {
                 match AgentDefinition::from_file(path) {
                     Ok(def) => def,
                     Err(e) => {
-                        tracing::warn!(
+                        tracing::error!(
                             path = path, error = % e,
-                            "Failed to load agent definition from file, falling back to default"
+                            "Failed to load agent definition from GROK_AGENT path"
                         );
-                        AgentDefinition::grok_build_plan()
+                        eprintln!(
+                            "error: failed to load agent from GROK_AGENT path '{path}': {e}"
+                        );
+                        crate::instrumentation::finalize_and_exit(1);
                     }
                 }
             }
-            Some(name) => {
-                xai_grok_agent::discovery::by_name_in_cwd(name, cwd)
-                    .unwrap_or_else(AgentDefinition::grok_build_plan)
-            }
+            Some(name) => match xai_grok_agent::discovery::require_by_name_in_cwd(name, cwd) {
+                Ok(def) => def,
+                Err(msg) => {
+                    tracing::error!(agent_name = %name, source = "GROK_AGENT", "{msg}");
+                    eprintln!("error: GROK_AGENT={name}: {msg}");
+                    crate::instrumentation::finalize_and_exit(1);
+                }
+            },
             None => AgentDefinition::grok_build_plan(),
         };
         if !grok_agent_env_set && !config_agent_explicitly_set
@@ -3214,7 +3223,16 @@ impl MvpAgent {
         );
         let skills = self.cfg.borrow().skills.clone();
         let compat = self.cfg.borrow().compat_resolved;
-        let acp_agent_profile = parse_agent_profile_from_meta(session_meta);
+        let acp_agent_profile = match parse_agent_profile_from_meta(session_meta, cwd.as_path()) {
+            crate::upload::turn::AgentProfileFromMeta::Absent => None,
+            crate::upload::turn::AgentProfileFromMeta::Ok(def) => Some(def),
+            crate::upload::turn::AgentProfileFromMeta::Invalid(msg) => {
+                // Explicit agent type that cannot resolve must not silently
+                // fall back to the default (e.g. --agent=typo → default agent).
+                eprintln!("error: {msg}");
+                return Err(acp::Error::invalid_params().data(msg));
+            }
+        };
         let session_default_agent_profile = acp_agent_profile
             .as_ref()
             .map(|d| d.name.clone());

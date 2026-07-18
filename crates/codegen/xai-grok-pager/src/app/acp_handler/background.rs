@@ -261,7 +261,7 @@ pub(super) fn handle_monitor_event(notif: &acp::ExtNotification, app: &mut AppVi
 
     let child_sid: &str = session_notif.session_id.0.as_ref();
     let session = if matches!(matched, SessionMatch::Child(_)) {
-        match agent.subagent_views.get_mut(child_sid) {
+        match super::routing::find_subagent_view_mut(agent, child_sid) {
             Some(child_view) => &mut child_view.session,
             None => return false,
         }
@@ -538,14 +538,11 @@ pub(super) fn handle_git_head_changed(notif: &acp::ExtNotification, app: &mut Ap
         return true;
     }
 
-    // Fallback: check child subagent views.
+    // Fallback: check child subagent views at any nesting depth
+    // (worker/watcher under manager under entrepreneur).
+    let target_sid = params.session_id.as_str();
     for agent in app.agents.values_mut() {
-        if let Some(child_view) = agent.subagent_views.values_mut().find(|cv| {
-            cv.session
-                .session_id
-                .as_ref()
-                .is_some_and(|s| s.0.as_ref() == params.session_id.as_str())
-        }) {
+        if let Some(child_view) = find_subagent_view_by_session_id(agent, target_sid) {
             crate::git_info::update_from_notification(
                 &child_view.session.cwd,
                 params.branch.as_deref(),
@@ -559,6 +556,39 @@ pub(super) fn handle_git_head_changed(notif: &acp::ExtNotification, app: &mut Ap
     }
 
     false
+}
+
+/// Walk the subagent tree for a view whose ACP `session_id` equals `sid`.
+fn find_subagent_view_by_session_id<'a>(
+    view: &'a mut AgentView,
+    sid: &str,
+) -> Option<&'a mut AgentView> {
+    let next_key = view
+        .subagent_views
+        .iter()
+        .find(|(_, child)| subagent_tree_has_session(child, sid))
+        .map(|(k, _)| k.clone())?;
+    let child = view.subagent_views.get_mut(&next_key)?;
+    if child
+        .session
+        .session_id
+        .as_ref()
+        .is_some_and(|s| s.0.as_ref() == sid)
+    {
+        return Some(child);
+    }
+    find_subagent_view_by_session_id(child, sid)
+}
+
+fn subagent_tree_has_session(view: &AgentView, sid: &str) -> bool {
+    view.session
+        .session_id
+        .as_ref()
+        .is_some_and(|s| s.0.as_ref() == sid)
+        || view
+            .subagent_views
+            .values()
+            .any(|c| subagent_tree_has_session(c, sid))
 }
 
 pub(super) fn handle_task_completed(notif: &acp::ExtNotification, app: &mut AppView) -> bool {

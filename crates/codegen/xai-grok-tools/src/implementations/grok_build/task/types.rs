@@ -9,7 +9,7 @@
 //!
 //! - `SubagentBackendResource` — wraps an `Arc<dyn SubagentBackend>` that
 //!   abstracts spawn/query/cancel (see [`super::backend`])
-//! - `SubagentDepthCounter` — tracks nesting depth (max 2; enables manager→worker nesting)
+//! - `SubagentDepthCounter` — tracks nesting depth (max 3; enables entrepreneur→manager→worker nesting)
 //! - `SessionIdResource` — carries the current session ID for parent scoping
 //! - `TaskModelValidator` — validates explicit model slugs before background spawn
 //!

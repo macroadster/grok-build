@@ -277,12 +277,37 @@ pub(crate) async fn complete_prompt_trace(
     }
     Ok(artifacts_confirmed)
 }
+/// Outcome of parsing `_meta.agentProfile`.
+///
+/// Distinguishes "not provided" from "provided but invalid" so callers can
+/// hard-fail instead of silently falling back to the default agent.
+#[derive(Debug)]
+pub(crate) enum AgentProfileFromMeta {
+    /// No `agentProfile` key (or empty meta).
+    Absent,
+    /// Resolved successfully.
+    Ok(xai_grok_agent::AgentDefinition),
+    /// Present but unusable (unknown type name, bad JSON, wrong JSON type).
+    Invalid(String),
+}
+
 /// Parse `_meta.agentProfile` as a JSON object or string name.
-/// Returns `None` if absent or invalid.
+///
+/// Explicit but invalid agent types return [`AgentProfileFromMeta::Invalid`]
+/// so the session path can reject them rather than silently using the default.
+///
+/// `cwd` is used when the profile is a string name so project agents under
+/// `.grok/agents/` resolve the same way as CLI `--agent` discovery.
 pub(crate) fn parse_agent_profile_from_meta(
     meta: Option<&agent_client_protocol::Meta>,
-) -> Option<xai_grok_agent::AgentDefinition> {
-    let value = meta?.get("agentProfile")?;
+    cwd: &std::path::Path,
+) -> AgentProfileFromMeta {
+    let Some(meta) = meta else {
+        return AgentProfileFromMeta::Absent;
+    };
+    let Some(value) = meta.get("agentProfile") else {
+        return AgentProfileFromMeta::Absent;
+    };
     if value.is_object() {
         return match xai_grok_agent::AgentDefinition::from_json(value) {
             Ok(def) => {
@@ -290,14 +315,12 @@ pub(crate) fn parse_agent_profile_from_meta(
                     agent_name = % def.name,
                     "Using ACP agent profile from _meta.agentProfile (JSON object)"
                 );
-                Some(def)
+                AgentProfileFromMeta::Ok(def)
             }
             Err(e) => {
-                tracing::error!(
-                    error = % e,
-                    "Failed to parse _meta.agentProfile JSON object, falling back to default agent"
-                );
-                None
+                let msg = format!("failed to parse _meta.agentProfile JSON object: {e}");
+                tracing::error!("{msg}");
+                AgentProfileFromMeta::Invalid(msg)
             }
         };
     }
@@ -305,13 +328,19 @@ pub(crate) fn parse_agent_profile_from_meta(
         tracing::info!(
             agent_name = % name, "Resolving agent from _meta.agentProfile (string name)"
         );
-        return xai_grok_agent::discovery::by_name(name);
+        return match xai_grok_agent::discovery::require_by_name_in_cwd(name, cwd) {
+            Ok(def) => AgentProfileFromMeta::Ok(def),
+            Err(msg) => {
+                tracing::error!(agent_name = %name, "{msg}");
+                AgentProfileFromMeta::Invalid(msg)
+            }
+        };
     }
-    tracing::warn!(
-        "Ignoring _meta.agentProfile: expected a JSON object or string, got {:?}",
-        value
+    let msg = format!(
+        "_meta.agentProfile must be a JSON object or string agent name, got {value:?}"
     );
-    None
+    tracing::error!("{msg}");
+    AgentProfileFromMeta::Invalid(msg)
 }
 /// Parse `_meta.askUserQuestion` as a boolean.
 ///
@@ -439,6 +468,35 @@ mod tests {
         let _ = super::super::trace::upload_turn_messages;
         let _ = super::super::trace::upload_turn_result;
     }
+    #[test]
+    fn parse_agent_profile_absent_when_missing() {
+        let meta = serde_json::json!({ "askUserQuestion" : true });
+        assert!(matches!(
+            parse_agent_profile_from_meta(meta.as_object(), std::path::Path::new("/tmp")),
+            AgentProfileFromMeta::Absent
+        ));
+    }
+
+    #[test]
+    fn parse_agent_profile_ok_for_builtin_name() {
+        let meta = serde_json::json!({ "agentProfile" : "entrepreneur" });
+        match parse_agent_profile_from_meta(meta.as_object(), std::path::Path::new("/tmp")) {
+            AgentProfileFromMeta::Ok(def) => assert_eq!(def.name, "entrepreneur"),
+            other => panic!("expected Ok(entrepreneur), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn parse_agent_profile_invalid_for_unknown_name() {
+        let meta = serde_json::json!({ "agentProfile" : "not-a-real-agent-xyz" });
+        match parse_agent_profile_from_meta(meta.as_object(), std::path::Path::new("/tmp")) {
+            AgentProfileFromMeta::Invalid(msg) => {
+                assert!(msg.contains("unknown agent type"), "msg={msg}");
+            }
+            other => panic!("expected Invalid, got {other:?}"),
+        }
+    }
+
     #[test]
     fn parse_ask_user_question_returns_false_when_disabled() {
         let meta = serde_json::json!({ "askUserQuestion" : false });

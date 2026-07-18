@@ -824,12 +824,24 @@ pub(crate) async fn run(
                 match xai_grok_shell::agent::config::AgentDefinition::from_file(&path) {
                     Ok(def) => app.agent_override = Some(def.to_json_value()),
                     Err(e) => {
-                        tracing::warn!("--agent: failed to load agent file: {e}");
+                        // Explicit --agent must not silently continue with the default.
+                        tracing::error!("--agent: failed to load agent file: {e}");
+                        eprintln!("error: --agent: failed to load agent file '{}': {e}", path.display());
+                        xai_grok_shell::instrumentation::finalize_and_exit(1);
                     }
                 }
             }
             crate::headless::ResolvedAgent::Name(name) => {
-                app.agent_override = Some(serde_json::Value::String(name));
+                // Resolve early so typos fail at startup instead of silently
+                // falling through to the default agent when the session opens.
+                match xai_grok_agent::discovery::require_by_name_in_cwd(&name, &app.cwd) {
+                    Ok(_) => app.agent_override = Some(serde_json::Value::String(name)),
+                    Err(msg) => {
+                        tracing::error!(agent = %name, "--agent: {msg}");
+                        eprintln!("error: --agent={name}: {msg}");
+                        xai_grok_shell::instrumentation::finalize_and_exit(1);
+                    }
+                }
             }
         }
     }

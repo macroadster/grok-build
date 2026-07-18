@@ -304,11 +304,31 @@ fn parse_cli_agents(
     Ok(agents)
 }
 
-fn apply_agent_flag(agent: &Option<String>, config: &mut xai_grok_shell::agent::config::Config) {
-    if let Some(agent) = agent {
-        match resolve_agent_arg(agent) {
-            ResolvedAgent::FilePath(path) => config.agent_profile_path = Some(path),
-            ResolvedAgent::Name(name) => config.agent.name = Some(name),
+/// Apply `--agent` to the shell config.
+///
+/// File paths are stored as `agent_profile_path` (loaded later with a hard
+/// fail on I/O errors). Named agents are resolved immediately so unknown
+/// types error at startup instead of silently falling back to the default.
+fn apply_agent_flag(
+    agent: &Option<String>,
+    config: &mut xai_grok_shell::agent::config::Config,
+    cwd: &std::path::Path,
+) -> anyhow::Result<()> {
+    let Some(agent) = agent else {
+        return Ok(());
+    };
+    match resolve_agent_arg(agent) {
+        ResolvedAgent::FilePath(path) => {
+            config.agent_profile_path = Some(path);
+            Ok(())
+        }
+        ResolvedAgent::Name(name) => {
+            // Validate now; store the name so resolve_agent_definition uses the
+            // same discovery path (including project agents under cwd).
+            xai_grok_agent::discovery::require_by_name_in_cwd(&name, cwd)
+                .map_err(|msg| anyhow::anyhow!("--agent={name}: {msg}"))?;
+            config.agent.name = Some(name);
+            Ok(())
         }
     }
 }
@@ -881,7 +901,7 @@ pub async fn run_single_turn(
     // No agent-level hub client URL (gateway-only cloud; workspace provider
     // hub_url lives on `grok workspace` / WorkspaceStartArgs only).
 
-    apply_agent_flag(&options.agent, &mut agent_config);
+    apply_agent_flag(&options.agent, &mut agent_config, &cwd)?;
 
     if let Some(ref json) = options.agents_json {
         agent_config.cli_agents = parse_cli_agents(json)?;

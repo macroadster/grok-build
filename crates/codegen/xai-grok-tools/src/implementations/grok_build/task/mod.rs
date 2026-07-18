@@ -602,11 +602,68 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn second_level_subagent_cannot_spawn_nested_subagent() {
+    async fn second_level_subagent_can_spawn_for_entrepreneur_chain() {
+        // Depth 2 is a manager under an entrepreneur (or a worker under a
+        // top-level manager). With MAX_SUBAGENT_DEPTH=3 it may still spawn so
+        // entrepreneur → manager → worker/watcher works.
+        let (backend, mut rx) = make_backend();
+        let mut resources = Resources::new();
+        resources.insert(backend);
+        resources.insert(SubagentDepthCounter(2));
+        resources.insert(SessionIdResource("manager-under-entrepreneur".to_string()));
+        resources.insert(CurrentPromptIdResource("prompt-789".to_string()));
+
+        let shared = resources.into_shared();
+        let handle = tokio::spawn(async move {
+            let request = unwrap_spawn(rx.recv().await.unwrap());
+            assert_eq!(request.subagent_type, "worker");
+            request
+                .result_tx
+                .send(SubagentResult {
+                    success: true,
+                    output: std::sync::Arc::from("worker done"),
+                    subagent_id: request.id.clone(),
+                    child_session_id: request.id.clone(),
+                    tool_calls: 1,
+                    turns: 1,
+                    duration_ms: 10,
+                    ..Default::default()
+                })
+                .unwrap();
+        });
+
+        let result = xai_tool_runtime::Tool::run(
+            &TaskTool,
+            test_ctx(shared),
+            TaskToolInput {
+                description: "nested spawn".into(),
+                prompt: "implement the change".into(),
+                subagent_type: "worker".into(),
+                run_in_background: false,
+                capability_mode: None,
+                isolation: None,
+                resume_from: None,
+                cwd: None,
+                model: None,
+                task_id: None,
+            },
+        )
+        .await;
+
+        handle.await.unwrap();
+        assert!(
+            result.is_ok(),
+            "depth-2 manager under entrepreneur must spawn worker: {result:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn third_level_subagent_cannot_spawn_nested_subagent() {
+        // Depth 3 is the bottom of entrepreneur → manager → worker/watcher.
         let (backend, _rx) = make_backend();
         let mut resources = Resources::new();
         resources.insert(backend);
-        resources.insert(SubagentDepthCounter(2)); // worker/watcher depth
+        resources.insert(SubagentDepthCounter(3)); // worker/watcher under entrepreneur chain
         resources.insert(SessionIdResource("worker-session".to_string()));
         resources.insert(CurrentPromptIdResource("prompt-789".to_string()));
 
@@ -632,7 +689,7 @@ mod tests {
         let err = result.unwrap_err().to_string();
         assert!(
             err.contains("depth limit exceeded"),
-            "subagent at depth 2 must not spawn: {err}"
+            "subagent at depth 3 must not spawn: {err}"
         );
     }
 

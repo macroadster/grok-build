@@ -8,11 +8,44 @@ use super::*;
 pub(super) enum SessionMatch {
     /// The session_id matches the root session of this agent.
     Root(AgentId),
-    /// The session_id matches a subagent view child of this agent
-    /// (i.e. an entry in `agent.subagent_views`). The child's key is the
-    /// notification's `session_id.0.as_ref()`; the caller re-derives it
-    /// to avoid an extra allocation.
+    /// The session_id matches a subagent view in this agent's tree
+    /// (direct child or deeper descendant under `subagent_views`).
+    /// The view's key is the notification's `session_id.0.as_ref()`;
+    /// resolve it with [`find_subagent_view_mut`] (recursive) rather than
+    /// a single-level `subagent_views` lookup so entrepreneur → manager →
+    /// worker/watcher nesting works.
     Child(AgentId),
+}
+
+/// Whether `sid` is registered anywhere in this view's subagent tree
+/// (direct or nested under another subagent).
+pub(super) fn subagent_tree_contains(view: &AgentView, sid: &str) -> bool {
+    view.subagent_views.contains_key(sid)
+        || view
+            .subagent_views
+            .values()
+            .any(|child| subagent_tree_contains(child, sid))
+}
+
+/// Mutable lookup of a subagent view by session id at any nesting depth.
+///
+/// Direct children are returned immediately; otherwise walks into the
+/// unique branch that contains `sid` (used for worker/watcher views
+/// nested under a manager under an entrepreneur root).
+pub(super) fn find_subagent_view_mut<'a>(
+    view: &'a mut AgentView,
+    sid: &str,
+) -> Option<&'a mut AgentView> {
+    if view.subagent_views.contains_key(sid) {
+        return view.subagent_views.get_mut(sid).map(|b| &mut **b);
+    }
+    let next_key = view
+        .subagent_views
+        .iter()
+        .find(|(_, child)| subagent_tree_contains(child, sid))
+        .map(|(k, _)| k.clone())?;
+    let child = view.subagent_views.get_mut(&next_key).map(|b| &mut **b)?;
+    find_subagent_view_mut(child, sid)
 }
 
 impl SessionMatch {
@@ -97,7 +130,7 @@ pub(super) fn resolve_target_view<'a>(
     &'a mut crate::scrollback::state::ScrollbackState,
 )> {
     if matches!(matched, SessionMatch::Child(_)) {
-        let child_view = agent.subagent_views.get_mut(child_sid)?;
+        let child_view = find_subagent_view_mut(agent, child_sid)?;
         Some((&mut child_view.session, &mut child_view.scrollback))
     } else {
         Some((&mut agent.session, &mut agent.scrollback))
@@ -108,8 +141,8 @@ pub(super) fn resolve_target_view<'a>(
 ///
 /// Search order:
 /// 1. Exact root match: an agent whose `session.session_id` equals `session_id`.
-/// 2. Subagent view: any agent whose `subagent_views` map contains `session_id`
-///    as a key.
+/// 2. Subagent view: any agent whose `subagent_views` tree contains `session_id`
+///    as a key (direct child or nested descendant — e.g. worker under manager).
 /// 3. Race-window fallback: when no exact match exists AND the currently active
 ///    agent has no `session_id` yet, route to it. Notifications can race ahead
 ///    of `TaskResult::SessionCreated`, and the only agent that could possibly
@@ -142,7 +175,7 @@ pub(super) fn find_session_match(
         if agent.session.session_id.as_ref() == Some(session_id) {
             return Some(SessionMatch::Root(*id));
         }
-        if child_match.is_none() && agent.subagent_views.contains_key(child_key) {
+        if child_match.is_none() && subagent_tree_contains(agent, child_key) {
             child_match = Some(*id);
         }
     }
