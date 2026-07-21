@@ -446,6 +446,17 @@ pub async fn run(
     >,
 ) -> anyhow::Result<bool> {
     xai_tty_utils::redirect_native_stderr();
+    // Validate `--agent` before connect / alt-screen so typos print on the
+    // main terminal and exit cleanly (event_loop used to check after
+    // EnterAlternateScreen, which hid the error on process::exit).
+    if let Some(ref agent) = args.agent {
+        let cwd = args
+            .cwd
+            .clone()
+            .or_else(|| std::env::current_dir().ok())
+            .unwrap_or_default();
+        let _ = crate::headless::resolve_agent_override(agent, &cwd)?;
+    }
     let screen_mode_override = screen_mode_relaunch::take_screen_mode_env_override();
     let cancel = CancellationToken::new();
     let startup_start = std::time::Instant::now();

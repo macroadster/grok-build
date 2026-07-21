@@ -277,6 +277,34 @@ pub(crate) fn resolve_agent_arg(agent: &str) -> ResolvedAgent {
     }
 }
 
+/// Resolve `--agent` into the JSON override used for session startup.
+///
+/// Unknown names and unreadable profile files fail immediately so callers can
+/// surface the error before taking over the terminal (TUI) or spawning a turn
+/// (headless).
+pub(crate) fn resolve_agent_override(
+    agent: &str,
+    cwd: &std::path::Path,
+) -> anyhow::Result<serde_json::Value> {
+    match resolve_agent_arg(agent) {
+        ResolvedAgent::FilePath(path) => {
+            let def = xai_grok_shell::agent::config::AgentDefinition::from_file(&path)
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "--agent: failed to load agent file '{}': {e}",
+                        path.display()
+                    )
+                })?;
+            Ok(def.to_json_value())
+        }
+        ResolvedAgent::Name(name) => {
+            xai_grok_agent::discovery::require_by_name_in_cwd(&name, cwd)
+                .map_err(|msg| anyhow::anyhow!("--agent={name}: {msg}"))?;
+            Ok(serde_json::Value::String(name))
+        }
+    }
+}
+
 fn parse_cli_agents(
     json: &str,
 ) -> anyhow::Result<Vec<xai_grok_shell::agent::config::AgentDefinition>> {
@@ -319,14 +347,15 @@ fn apply_agent_flag(
     };
     match resolve_agent_arg(agent) {
         ResolvedAgent::FilePath(path) => {
+            // Validate the profile loads (same hard-fail contract as TUI).
+            let _ = resolve_agent_override(agent, cwd)?;
             config.agent_profile_path = Some(path);
             Ok(())
         }
         ResolvedAgent::Name(name) => {
             // Validate now; store the name so resolve_agent_definition uses the
             // same discovery path (including project agents under cwd).
-            xai_grok_agent::discovery::require_by_name_in_cwd(&name, cwd)
-                .map_err(|msg| anyhow::anyhow!("--agent={name}: {msg}"))?;
+            let _ = resolve_agent_override(agent, cwd)?;
             config.agent.name = Some(name);
             Ok(())
         }
@@ -1782,6 +1811,28 @@ fn handle_ext_notification(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn resolve_agent_override_rejects_unknown_name() {
+        let err = super::resolve_agent_override("not-exist", std::path::Path::new("."))
+            .expect_err("unknown agent must fail");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("unknown agent type 'not-exist'"),
+            "unexpected message: {msg}"
+        );
+        assert!(
+            msg.starts_with("--agent=not-exist:"),
+            "unexpected prefix: {msg}"
+        );
+    }
+
+    #[test]
+    fn resolve_agent_override_accepts_builtin_name() {
+        let value = super::resolve_agent_override("explore", std::path::Path::new("."))
+            .expect("builtin explore must resolve");
+        assert_eq!(value, serde_json::Value::String("explore".into()));
+    }
+
     #[test]
     fn lifecycle_tracking_is_independent_of_wait_flag() {
         let mut pending = std::collections::HashSet::new();
