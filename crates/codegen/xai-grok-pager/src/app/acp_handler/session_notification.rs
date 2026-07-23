@@ -853,6 +853,7 @@ pub(super) fn apply_subagent_lifecycle(
                 user_model_preference: None,
                 deferred_model_switch: None,
                 in_flight_prompt: None,
+                compact_held_prompt: None,
                 current_prompt_id: None,
                 created_via_new: false,
             };
