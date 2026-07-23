@@ -614,7 +614,7 @@ pub struct PagerArgs {
     /// Disable cross-session memory for this session.
     #[arg(long = "no-memory", conflicts_with = "experimental_memory")]
     pub no_memory: bool,
-    /// Agent name or definition file path.
+    /// Agent name or definition file path (default: entrepreneur).
     #[arg(long = "agent", value_name = "NAME")]
     pub agent: Option<String>,
     /// Inline subagent definitions as JSON.

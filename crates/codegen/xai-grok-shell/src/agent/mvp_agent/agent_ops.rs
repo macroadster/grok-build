@@ -2850,7 +2850,7 @@ impl MvpAgent {
     /// 3. `agent_profile_path` from CLI `--agent-profile`.
     /// 4. `agent_config` from config.toml `[agent]`.
     /// 5. `GROK_AGENT` env var.
-    /// 6. Built-in default agent.
+    /// 6. Built-in session default (`entrepreneur` / `DEFAULT_SESSION_AGENT`).
     ///
     /// `GROK_AGENT` and an explicit `[agent] name` bypass step 1.
     /// Strict-harness classification is structural — see
@@ -2973,7 +2973,9 @@ impl MvpAgent {
                     crate::instrumentation::finalize_and_exit(1);
                 }
             },
-            None => AgentDefinition::grok_build_plan(),
+            // Built-in session default (not model agent_type). Keep in sync with
+            // `config::DEFAULT_SESSION_AGENT`.
+            None => AgentDefinition::entrepreneur(),
         };
         if !grok_agent_env_set && !config_agent_explicitly_set
             && model_requires_strict_harness && let Some(required) = model_agent_type

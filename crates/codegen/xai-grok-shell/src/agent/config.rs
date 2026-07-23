@@ -39,8 +39,17 @@ pub enum AgentMode {
     #[default]
     Generic,
 }
-/// Default agent type when the server or user config doesn't specify one.
+/// Default model `agent_type` when the server or user config doesn't specify one.
+///
+/// This must stay a **non-strict** stock harness (`grok-build*`). Strict types
+/// (e.g. `entrepreneur`) would preempt ACP `_meta.agentProfile` when the model
+/// catalog falls through to this default.
 pub const DEFAULT_AGENT_TYPE: &str = "grok-build-plan";
+/// Session agent when the user did not pass `--agent` / `GROK_AGENT` / `[agent] name`.
+///
+/// Distinct from [`DEFAULT_AGENT_TYPE`]: sessions start as `entrepreneur` (top of
+/// manager → worker/watcher) even though model catalog defaults remain stock.
+pub const DEFAULT_SESSION_AGENT: &str = "entrepreneur";
 /// Serde default for `ModelInfo.agent_type` and `ModelEntryConfig.agent_type`.
 pub fn default_agent_type() -> String {
     DEFAULT_AGENT_TYPE.to_owned()
@@ -4156,8 +4165,8 @@ pub struct ModelInfo {
     /// concise tool output, concise user message prefix, reduced toolset).
     pub use_concise: bool,
     /// The type of agent configuration to use for this model.
-    /// Always has a value; defaults to `"grok-build-plan"` when the server
-    /// or user config doesn't specify one.
+    /// Always has a value; defaults to `"grok-build-plan"` ([`DEFAULT_AGENT_TYPE`])
+    /// when the server or user config doesn't specify one.
     #[serde(default = "default_agent_type")]
     pub agent_type: String,
     /// Per-chunk idle timeout for inference streaming (see `ModelEntryConfig`).

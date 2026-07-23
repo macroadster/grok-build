@@ -649,10 +649,10 @@ async fn upload_harness_trace_turns_build_per_turn_manifest() {
     );
     assert_eq!(m1.artifacts.len(), 2, "no cross-turn contamination");
 }
-/// With no overrides and model_agent_type = None, the default agent is used.
+/// With no overrides and model_agent_type = None, the session default agent is used.
 #[test]
 #[serial_test::serial]
-fn resolve_agent_definition_defaults_to_grok_build() {
+fn resolve_agent_definition_defaults_to_session_default_agent() {
     let prev = std::env::var("GROK_AGENT").ok();
     unsafe {
         std::env::remove_var("GROK_AGENT");
@@ -665,13 +665,14 @@ fn resolve_agent_definition_defaults_to_grok_build() {
         None,
         None,
     );
-    assert_eq!(def.name, config::DEFAULT_AGENT_TYPE);
+    assert_eq!(def.name, config::DEFAULT_SESSION_AGENT);
+    assert_eq!(def.name, "entrepreneur");
     if let Some(v) = prev {
         unsafe { std::env::set_var("GROK_AGENT", v) }
     }
 }
 /// When model_agent_type = Some("codex"), the codex agent is selected even
-/// though the default chain would return grok-build.
+/// though the default chain would return the stock default agent.
 #[test]
 #[serial_test::serial]
 fn resolve_agent_definition_model_agent_type_overrides_default() {
@@ -692,9 +693,9 @@ fn resolve_agent_definition_model_agent_type_overrides_default() {
         unsafe { std::env::set_var("GROK_AGENT", v) }
     }
 }
-/// When model_agent_type is None, the chain-resolved default agent is
+/// When model_agent_type is None, the chain-resolved session default agent is
 /// NOT overridden. This is the crux of the leader-mode fix: a session whose
-/// model has no agent_type must get the default agent, not a stale value
+/// model has no agent_type must get the session default, not a stale value
 /// from a different client's model.
 #[test]
 #[serial_test::serial]
@@ -711,7 +712,7 @@ fn resolve_agent_definition_none_agent_type_does_not_override() {
         None,
         None,
     );
-    assert_eq!(def.name, config::DEFAULT_AGENT_TYPE);
+    assert_eq!(def.name, config::DEFAULT_SESSION_AGENT);
     if let Some(v) = prev {
         unsafe { std::env::set_var("GROK_AGENT", v) }
     }
