@@ -90,6 +90,14 @@ pub(super) fn dispatch_cancel_turn(app: &mut AppView) -> Vec<Effect> {
             CancelOrigin::UserGesture,
         );
     }
+    // The permission card owns the keyboard and the mouse. The ask panel would open under it and could not be answered.
+    if app
+        .agents
+        .get(&id)
+        .is_some_and(AgentView::permission_hides_subagent_stop)
+    {
+        return stop_subagents_under_permission_card(app);
+    }
     // Focused running subagent with no child view (no overlay to cancel through): kill is the same action as the row's kill button
     let focused_subagent_kill = app.agents.get(&id).and_then(|agent| {
         let child_sid = agent.active_subagent.as_ref()?;
@@ -203,6 +211,80 @@ pub(super) fn dispatch_cancel_turn(app: &mut AppView) -> Vec<Effect> {
         preferred_cancel_subagents.unwrap_or(true),
         CancelOrigin::UserGesture,
     )
+}
+
+/// Stop subagents while a permission card is up. The ask panel cannot take input under that card.
+/// `ask` (the default) and `always_stop` stop every non-workflow subagent. `always_continue` only drops the card, which cancels the parked command.
+/// A running parent turn carries the stop on `session/cancel`. An idle parent has no turn to cancel, so each running subagent is killed directly.
+fn stop_subagents_under_permission_card(app: &mut AppView) -> Vec<Effect> {
+    let ActiveView::Agent(id) = app.active_view else {
+        return vec![];
+    };
+    let ui_pref = effective_cancel_subagents_preference(None, &app.current_ui);
+    let (stop_subagents, cancelling, stoppable) = {
+        let Some(agent) = app.agents.get_mut(&id) else {
+            return vec![];
+        };
+        drain_permission_queue(agent);
+        agent.cancel_turn_view = None;
+        agent.cancel_turn_buttons.clear();
+        let stop_subagents = agent
+            .cancel_subagents_preference
+            .or(ui_pref)
+            .unwrap_or(true);
+        (
+            stop_subagents,
+            agent.session.state.is_cancelling(),
+            agent.stoppable_activity_running(),
+        )
+    };
+    let mut effects = Vec::new();
+    if cancelling {
+        if let Some(agent) = app.agents.get_mut(&id)
+            && let Some(session_id) = agent.session.session_id.clone()
+        {
+            agent.clear_send_now_expectation();
+            effects.push(emit_cancel_turn(
+                agent,
+                session_id,
+                stop_subagents,
+                /* rewind_prompt_id */ None,
+            ));
+        }
+    } else if stoppable {
+        effects.extend(do_cancel_turn(
+            app,
+            stop_subagents,
+            CancelOrigin::UserGesture,
+        ));
+    }
+    let shell_stops_subagents = effects.iter().any(|effect| {
+        matches!(
+            effect,
+            Effect::CancelTurn {
+                cancel_subagents: true,
+                ..
+            }
+        )
+    });
+    if stop_subagents && !shell_stops_subagents {
+        let ids: Vec<String> = app
+            .agents
+            .get(&id)
+            .map(|agent| {
+                agent
+                    .subagent_sessions
+                    .values()
+                    .filter(|info| info.is_running() && info.attempt.workflow_run_id.is_none())
+                    .map(|info| info.subagent_id.to_string())
+                    .collect()
+            })
+            .unwrap_or_default();
+        for subagent_id in ids {
+            effects.extend(dispatch_kill_subagent(app, subagent_id));
+        }
+    }
+    effects
 }
 
 pub(super) fn dispatch_cancel_turn_choice(
