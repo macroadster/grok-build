@@ -1201,6 +1201,20 @@ impl AgentView {
     fn has_running_foreground_subagent(&self) -> bool {
         self.running_foreground_subagents().next().is_some()
     }
+    /// A permission card is covering stop. The cancel-turn ask panel would render under that card, so Ctrl+C and [stop] cannot ask.
+    /// True when the card is a subagent command, or any non-workflow subagent is still running.
+    pub(crate) fn permission_hides_subagent_stop(&self) -> bool {
+        if self.permission_queue.is_empty() {
+            return false;
+        }
+        self.permission_queue
+            .iter()
+            .any(|perm| perm.subagent_label.is_some())
+            || self
+                .subagent_sessions
+                .values()
+                .any(|info| info.is_running() && info.attempt.workflow_run_id.is_none())
+    }
     /// The one predicate shared by the wait gate and its subject.
     fn running_foreground_subagents(
         &self,

@@ -909,6 +909,120 @@ fn cancel_turn_with_running_subagents_shows_panel() {
     assert!(get_agent(&app, id).session.state.is_turn_running());
 }
 
+/// The permission card hides the ask panel. Stop must cancel the turn and the subagents instead of opening a panel nobody can answer.
+#[test]
+fn permission_card_stops_running_subagents_without_ask_panel() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent
+            .subagent_sessions
+            .insert("child-1".into(), make_test_subagent("child-1", "sa-1"));
+        agent
+            .permission_queue
+            .push_back(crate::app::agent_view::test_fixtures::make_followup_permission_state());
+    }
+
+    let effects = dispatch(Action::CancelTurn, &mut app);
+
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::CancelTurn {
+                cancel_subagents: true,
+                ..
+            }]
+        ),
+        "got {effects:?}"
+    );
+    assert!(get_agent(&app, id).permission_queue.is_empty());
+    assert!(get_agent(&app, id).cancel_turn_view.is_none());
+    assert!(get_agent(&app, id).session.state.is_cancelling());
+}
+
+/// Background subagents keep the parent idle. There is no turn to cancel, so stop has to kill them.
+#[test]
+fn permission_card_on_idle_parent_kills_running_subagents() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::Idle;
+        agent
+            .subagent_sessions
+            .insert("child-1".into(), make_test_subagent("child-1", "sa-1"));
+        agent
+            .subagent_sessions
+            .insert("child-2".into(), make_test_subagent("child-2", "sa-2"));
+        agent
+            .permission_queue
+            .push_back(crate::app::agent_view::test_fixtures::make_followup_permission_state());
+    }
+
+    let effects = dispatch(Action::CancelTurn, &mut app);
+
+    let mut killed: Vec<&str> = effects
+        .iter()
+        .filter_map(|effect| match effect {
+            Effect::KillSubagent { subagent_id, .. } => Some(subagent_id.as_str()),
+            _ => None,
+        })
+        .collect();
+    killed.sort_unstable();
+    assert_eq!(killed, ["sa-1", "sa-2"], "got {effects:?}");
+    assert!(get_agent(&app, id).permission_queue.is_empty());
+    assert!(get_agent(&app, id).session.state.is_idle());
+    assert!(
+        get_agent(&app, id)
+            .subagent_sessions
+            .values()
+            .all(|info| info.attempt.pending_kill)
+    );
+}
+
+/// always_continue still leaves the other subagents running, but the card itself is dropped so the parked command ends.
+#[test]
+fn permission_card_always_continue_drops_the_card_without_killing() {
+    let mut app = test_app_with_agent();
+    let id = AgentId(0);
+    app.current_ui.cancel_subagents_on_turn_cancel = Some("always_continue".into());
+    {
+        let agent = app.agents.get_mut(&id).unwrap();
+        agent.session.state = AgentState::TurnRunning;
+        agent
+            .subagent_sessions
+            .insert("child-1".into(), make_test_subagent("child-1", "sa-1"));
+        agent
+            .permission_queue
+            .push_back(crate::app::agent_view::test_fixtures::make_followup_permission_state());
+    }
+
+    let effects = dispatch(Action::CancelTurn, &mut app);
+
+    assert!(
+        matches!(
+            effects.as_slice(),
+            [Effect::CancelTurn {
+                cancel_subagents: false,
+                ..
+            }]
+        ),
+        "got {effects:?}"
+    );
+    assert!(get_agent(&app, id).permission_queue.is_empty());
+    assert!(get_agent(&app, id).cancel_turn_view.is_none());
+    assert!(
+        !get_agent(&app, id)
+            .subagent_sessions
+            .get("child-1")
+            .unwrap()
+            .attempt
+            .pending_kill
+    );
+}
+
 #[test]
 fn cancel_turn_choice_stop_running_sends_cancel_true() {
     use crate::views::modal::CancelTurnChoice;

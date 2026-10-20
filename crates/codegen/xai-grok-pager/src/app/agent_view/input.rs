@@ -719,9 +719,21 @@ impl AgentView {
                     if key!('q', CONTROL).matches(key) {
                         return InputOutcome::Unchanged;
                     }
+                    // The card owns the keyboard, so a normal CancelTurn never runs and the ask panel would open under it.
+                    // Stop the subagents directly instead of cancelling only this one permission.
+                    if registry.matches_id(ActionId::CancelTurn, key)
+                        && self.permission_hides_subagent_stop()
+                    {
+                        self.cancel_trigger_hint = Some(crate::app::actions::CancelTrigger::CtrlC);
+                        return InputOutcome::Action(Action::CancelTurn);
+                    }
                     self.handle_permission_key(key)
                 }
                 Event::Mouse(mouse) => {
+                    if let Some(outcome) = self.permission_card_stop_click(mouse) {
+                        self.scrollbar_dragging = false;
+                        return outcome;
+                    }
                     self.scrollbar_dragging = false;
                     let in_followup = self.permission_queue.front().is_some_and(|p| {
                         p.focus == crate::views::permission_view::PermissionFocus::FollowupInput
@@ -2271,6 +2283,103 @@ mod mid_turn_esc_hint_tests {
         assert_eq!(
             Some(crate::app::actions::CancelTrigger::CtrlC),
             agent.cancel_trigger_hint
+        );
+    }
+}
+#[cfg(test)]
+mod permission_stop_tests {
+    use super::test_fixtures::{make_agent, make_followup_permission_state, running_subagent_info};
+    use crate::actions::ActionRegistry;
+    use crate::app::actions::{Action, CancelTrigger};
+    use crate::app::app_view::InputOutcome;
+    use crossterm::event::{
+        Event, KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind,
+    };
+    use ratatui::layout::Rect;
+
+    fn ctrl_c() -> Event {
+        Event::Key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))
+    }
+
+    fn click(column: u16, row: u16) -> Event {
+        Event::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column,
+            row,
+            modifiers: KeyModifiers::empty(),
+        })
+    }
+
+    /// A parent command approval still uses Ctrl+C to reject that one request.
+    #[test]
+    fn ctrl_c_on_parent_permission_cancels_only_the_request() {
+        let mut agent = make_agent();
+        agent
+            .permission_queue
+            .push_back(make_followup_permission_state());
+        let outcome = agent.handle_input(&ctrl_c(), &ActionRegistry::defaults());
+        assert!(
+            matches!(outcome, InputOutcome::Action(Action::PermissionCancel)),
+            "got {outcome:?}"
+        );
+        assert!(
+            !agent.permission_queue.is_empty(),
+            "the card stays until dispatch answers it"
+        );
+    }
+
+    /// Subagents parked on a command approval must not keep running because the card ate Ctrl+C.
+    #[test]
+    fn ctrl_c_on_permission_with_running_subagents_stops_the_turn() {
+        let mut agent = make_agent();
+        agent
+            .subagent_sessions
+            .insert("child-1".into(), running_subagent_info("child-1"));
+        agent
+            .permission_queue
+            .push_back(make_followup_permission_state());
+        let outcome = agent.handle_input(&ctrl_c(), &ActionRegistry::defaults());
+        assert!(
+            matches!(outcome, InputOutcome::Action(Action::CancelTurn)),
+            "got {outcome:?}"
+        );
+        assert_eq!(Some(CancelTrigger::CtrlC), agent.cancel_trigger_hint);
+    }
+
+    /// [stop] is painted during the card, but the card used to swallow the click.
+    #[test]
+    fn stop_button_click_reaches_cancel_while_permission_is_focused() {
+        let mut agent = make_agent();
+        agent
+            .subagent_sessions
+            .insert("child-1".into(), running_subagent_info("child-1"));
+        agent
+            .permission_queue
+            .push_back(make_followup_permission_state());
+        agent.hit_cancel_button.set(Some(Rect::new(4, 2, 7, 1)));
+        let outcome = agent.handle_input(&click(5, 2), &ActionRegistry::defaults());
+        assert!(
+            matches!(outcome, InputOutcome::Action(Action::CancelTurn)),
+            "got {outcome:?}"
+        );
+        assert_eq!(Some(CancelTrigger::Mouse), agent.cancel_trigger_hint);
+    }
+
+    /// A tasks-pane row stop is the same gesture and must not be eaten by the card.
+    #[test]
+    fn tasks_pane_kill_reaches_the_subagent_while_permission_is_focused() {
+        let mut agent = make_agent();
+        agent
+            .permission_queue
+            .push_back(make_followup_permission_state());
+        agent.tasks.kill_button_rects.push((
+            crate::views::tasks_pane::TaskEntryId::Agent("sa-child-1".into()),
+            Rect::new(10, 4, 4, 1),
+        ));
+        let outcome = agent.handle_input(&click(11, 4), &ActionRegistry::defaults());
+        assert!(
+            matches!(outcome, InputOutcome::Action(Action::KillSubagent(ref id)) if id == "sa-child-1"),
+            "got {outcome:?}"
         );
     }
 }
