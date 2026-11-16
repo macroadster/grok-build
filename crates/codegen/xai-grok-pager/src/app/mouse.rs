@@ -24,6 +24,59 @@ impl AgentView {
         self.last_prompt_click_ms = Some(now);
         is_double
     }
+    /// Stop targets that must work while a permission card owns mouse input.
+    /// The card's handler returns before [`Self::handle_mouse`], so the stop button, a dock row stop, and a tasks-pane kill would otherwise do nothing.
+    /// `Some(Changed)` means the click landed on a stop rect that did not resolve to an action and must not fall through to the card.
+    pub(super) fn permission_card_stop_click(
+        &mut self,
+        mouse: &MouseEvent,
+    ) -> Option<InputOutcome> {
+        if !matches!(mouse.kind, MouseEventKind::Down(MouseButton::Left)) {
+            return None;
+        }
+        let pos = (mouse.column, mouse.row);
+        if self.hit_cancel_button.contains(mouse.column, mouse.row)
+            && !self.pos_occluded(mouse.column, mouse.row)
+        {
+            self.cancel_trigger_hint = Some(crate::app::actions::CancelTrigger::Mouse);
+            return Some(InputOutcome::Action(Action::CancelTurn));
+        }
+        if let Some(hit) = self
+            .dock_stop_button
+            .clone()
+            .filter(|hit| hit.rect.contains(pos.into()))
+        {
+            if self.pos_occluded(mouse.column, mouse.row) {
+                return Some(InputOutcome::Changed);
+            }
+            let Some(item) = self.dock_item_at(self.pane_areas.dock, mouse.row) else {
+                return Some(InputOutcome::Changed);
+            };
+            let Some(action) = self.dock_stop_action(item) else {
+                return Some(InputOutcome::Changed);
+            };
+            if super::agent_view::DockKillId::from_action(&action).as_ref() != Some(&hit.id) {
+                return Some(InputOutcome::Changed);
+            }
+            return Some(InputOutcome::Action(action));
+        }
+        for (entry_id, rect) in &self.tasks.kill_button_rects {
+            if !rect.contains(pos.into()) {
+                continue;
+            }
+            use crate::views::tasks_pane::TaskEntryId;
+            let action = match entry_id {
+                TaskEntryId::BgTask(tid) => Action::KillBgTask(tid.clone()),
+                TaskEntryId::Agent(sid) => Action::KillSubagent(sid.clone()),
+                TaskEntryId::Scheduled(tid) => Action::CancelScheduledTask(tid.clone()),
+                TaskEntryId::Workflow(name) => {
+                    Action::SendSlashCommandPreservingDraft(format!("/workflow stop {name}"))
+                }
+            };
+            return Some(InputOutcome::Action(action));
+        }
+        None
+    }
     /// Handle mouse events: click-to-focus, forward to prompt textarea.
     ///
     /// Scroll events are handled at app level.

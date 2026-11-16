@@ -26,7 +26,8 @@ enum QuestionSwitch {
 impl AgentView {
     /// Handle key input for the permission card.
     /// Like the question card it has an option-row mode and text modes (a followup message to the agent, and a hand-written always-allow pattern).
-    /// `Esc` steps back down through them ([`AgentView::card_esc`]) and `Ctrl+C` is the only cancel.
+    /// `Esc` steps back down through them ([`AgentView::card_esc`]).
+    /// `Ctrl+C` cancels this request, unless [`AgentView::permission_hides_subagent_stop`] already turned it into a turn stop.
     pub(super) fn handle_permission_key(&mut self, key: &KeyEvent) -> InputOutcome {
         use crate::views::permission_view::PermissionFocus;
         if key.code == KeyCode::Esc {
